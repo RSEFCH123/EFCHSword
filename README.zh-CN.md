@@ -10,6 +10,8 @@ EFCHSword的驱动模式可以在Windows10及以上的系统中运行,EFCHSword�
   - DLL加载管理
   - 进程的窗口View与管理  
   - 进程的线程View与管理  
+  - 重新设置PID  
+  - 进程保护  
   - 等  
 ### 窗口管理  
   - View窗口  
@@ -31,11 +33,19 @@ EFCHSword的驱动模式可以在Windows10及以上的系统中运行,EFCHSword�
   - 等  
 ### 进程行为监视  
   - 可监视进程的File/Registry/Network行为  
-### 工具(多种工具)  
+### 工具  
+  - 快速关闭计算机电源  
+  - NT驱动加载与调试  
+  - 电脑配置查看  
+  - Windows Update 设置  
+  - 文件数据查看  
+  - DiskHex  
 ### 注册表管理  
   - 注册表View  
   - 删除注册项  
   - 新建注册项  
-  - 注册项管理  
-在这个工具的Debug窗口中有我联系方式,如果你需要EFCHSword的源代码请联系我
+  - 注册项管理
+### Windows NT Kernel Control
+  - Driver View  
+  - Driver Unloader  
 ### 注意!因为本软件造成的问题,开发者不承担任何责任

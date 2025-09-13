@@ -12,7 +12,7 @@ Function Introduction
   - window view of management process  
   - thread view and management of management process  
   - reset pid
-  - protect process  
+  - process protecties  
   - and more  
 
 ### Window management  
@@ -36,8 +36,8 @@ Function Introduction
 ### Process behavior monitoring  
   - can monitor the File/Registry/Network behavior of processes  
 ### Tools  
-  - fast power off  
-  - NT driver loader and Debug  
+  - Fast power off  
+  - NT driver loader and debug  
   - PC configuration information  
   - Windows Update setting  
   - File data reader  
@@ -48,6 +48,7 @@ Function Introduction
   - Key New Registration  
   - Key Registration  
   - Key Management  
-
-The Debug window of this tool has my personal contact information, If you want to get the source code of EFCHSword, please contact me  
+### Windows NT Kernel Control  
+  - Driver View  
+  - Driver Unloader  
 ### Warnning! The developer shall not be held responsible for any issues caused by this software  

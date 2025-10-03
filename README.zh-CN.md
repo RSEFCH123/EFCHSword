@@ -3,7 +3,7 @@ EFCHSword是一款适用于Windows平台的驱动级计算机管理软件，具�
 EFCHSword的驱动模式可以在Windows10及以上的系统中运行,EFCHSword的无驱动模式可以在Windows7及以上运行  
 功能介绍  
 ### 进程方面  
-  - View进程  
+  - 进程枚举  
   - 终止进程  
   - 暂停/恢复进程  
   - 进程优先级管理  
@@ -14,11 +14,11 @@ EFCHSword的驱动模式可以在Windows10及以上的系统中运行,EFCHSword�
   - 进程保护  
   - 等  
 ### 窗口管理  
-  - View窗口  
+  - 窗口枚举  
   - 关闭窗口  
   - 等  
 ### 文件管理  
-  - View文件  
+  - 文件枚举  
   - 文件提取  
   - 文件保护  
   - 删/强删/驱动删文件  
@@ -32,7 +32,7 @@ EFCHSword的驱动模式可以在Windows10及以上的系统中运行,EFCHSword�
   - 服务管理  
   - 等  
 ### 进程行为监视  
-  - 可监视进程的File/Registry/Network行为  
+  - 可监视进程的文件/注册表/网络行为  
 ### 工具  
   - 快速关闭计算机电源  
   - NT驱动加载与调试  
@@ -45,7 +45,7 @@ EFCHSword的驱动模式可以在Windows10及以上的系统中运行,EFCHSword�
   - 删除注册项  
   - 新建注册项  
   - 注册项管理
-### Windows NT Kernel Control
-  - Driver View  
-  - Driver Unloader  
+### Windows NT 内核管理  
+  - 驱动枚举  
+  - 驱动卸载    
 ### 注意!因为本软件造成的问题,开发者不承担任何责任

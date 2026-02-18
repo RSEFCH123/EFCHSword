@@ -2,3 +2,4 @@
 -NoSystemVerCheck:不进行系统版本检测 Do`t perform system version  
 -NoDriver:不安装驱动 Do`t install driver  
 -Fake:伪装模式,如果被Rootkit杀死可以试试这个 Fake mode,If have Rookit you can use fake mode
+-FakeSafe:伪装模式(安全),如果-Fake蓝屏可以试试这个 Fake mode(Safely),If Fake mode is Bule Screen you can use it

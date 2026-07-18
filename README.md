@@ -4,9 +4,9 @@
 </p>
 
 <p align="center">
-<img alt="Platform" src="">
-<img alt="Mode" src="">
-<img alt="Version" src="">
+<img alt="Platform" src="https://img.shields.io/badge/平台-Windows%207%2B%20%2F%20Win10%2B%20驱动-blue">
+<img alt="Mode" src="https://img.shields.io/badge/运行模式-R0%20%2F%20R3-cyan">
+<img alt="Version" src="https://img.shields.io/badge/版本-EFCHSword%20%2F%20EFCHSwordNeo-orange">
 </p>
 
 <p align="center">
@@ -72,7 +72,7 @@ DLL 加载管理
 进程线程管理  
 重置 PID  
 进程保护  
-**窗口管理**  
+⊞ 窗口管理  
 查看所有活动窗口  
 强制关闭窗口  
 窗口置顶 / 取消置顶  
@@ -114,7 +114,7 @@ DiskHex
 | 🎨 多色彩蓝屏 | 重新定义系统崩溃的视觉表达，甚至可以彩色蓝屏 |
 | 🔑 SudoForWindows | 让普通程序无视文件权限，类 Unix sudo 的 Windows 实现 |
 | 🚫 禁用蓝屏 | 让系统不再蓝屏，在极端场景下维持持续运行 |
-| ⏻ 关闭 CPU | 让整个屏幕冻结，极致的系统级控制能力展示 |  
+| 🔒 关闭 CPU | 让整个屏幕冻结，极致的系统级控制能力展示 |  
   
 ⚠️ 重要提示  
 EFCHSword 使用驱动级操作，实验性功能具有高度危险性，请谨慎使用。开发者对因使用本软件导致的任何问题不承担责任。  

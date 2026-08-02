@@ -36,6 +36,8 @@ typedef LONG(NTAPI* NtUnloadDriver_t)(PUNICODE_STRING DriverServiceName);
 // 这里存在易语言版本与驱动定义的命名差异，按易语言实际调用码为准
 #define IOCTL_FORCEPROTECTPROCESS      0x80F
 #define IOCTL_UNFORCEPROTECTPROCESS    0x810
+#define IOCTL_ENUMTHREADBYPROCESS      0x811   // 输入PID，输出 ULONG count + THREAD_OUTPUT_ENTRY[]
+#define IOCTL_GETDRIVERPATCHBYETHREAD  0x812   // 输入PETHREAD(8B)，输出 WCHAR[] 驱动完整路径
 
 // Disk / FileSystem
 #define IOCTL_NTFSDELETEFILE           0x900
@@ -64,6 +66,10 @@ typedef LONG(NTAPI* NtUnloadDriver_t)(PUNICODE_STRING DriverServiceName);
 #define IOCTL_STORDIRECT_READDISK      0x918
 #define IOCTL_GETVOLUMERAIDPORT        0x919
 #define IOCTL_FLUSHMFT                 0x920
+#define IOCTL_NTFS_INIT                0x921   // 输入WCHAR盘符, 初始化NTFS卷上下文
+#define IOCTL_NTFS_READFILE            0x922   // 输入4096B路径, 输出文件内容
+#define IOCTL_NTFS_ENUMDIR             0x925   // 输入路径, 输出 NTFS_DATA_INFO[]
+#define IOCTL_NTFS_GETQTY              0x926   // 输入路径, 输出 NTFS_FILE_FOLDER_QUANTITY
 
 // Thread
 #define IOCTL_SUSPENDTHREAD            0xA01
@@ -73,6 +79,7 @@ typedef LONG(NTAPI* NtUnloadDriver_t)(PUNICODE_STRING DriverServiceName);
 #define IOCTL_PSPTERMINATETHREADBYPOINTER_EASY 0xA05
 #define IOCTL_PSPTERMINATETHREADBYPOINTER      0xA06
 #define IOCTL_APCTERMINATETHREAD       0xA07
+#define IOCTL_APCTERMINATETHREADBYETHREAD 0xA08  // 输入PETHREAD(8B), APC方式销毁线程
 
 // System
 #define IOCTL_KEBUGCHECK               0xB00
@@ -373,11 +380,23 @@ bool KernelDriver::uninstallDrive(const QString& serviceName, bool stopFirst)
 
 bool KernelDriver::installDriver(const QString& sysFilePath, QString* errMsg)
 {
-    if (m_hDevice != INVALID_HANDLE_VALUE) {
+    if (m_hDevice != INVALID_HANDLE_VALUE && m_hDevice != nullptr) {
         if (errMsg) *errMsg = QStringLiteral("驱动已加载");
         return true;
     }
 
+    // 1. 先尝试打开已加载的设备（可能上次加载后未卸载，sys 文件仍被占用无法重写）
+    //    这一步在文件存在检查之前，避免在驱动已加载但 sys 不可写时误报失败
+    m_hDevice = getDriveHandle(m_driverName);
+    if (m_hDevice != INVALID_HANDLE_VALUE && m_hDevice != nullptr) {
+        qInfo() << "Driver already loaded, opened existing device handle";
+        m_driverPath = sysFilePath;
+        if (errMsg) *errMsg = QStringLiteral("驱动已加载（复用现有实例）");
+        return true;
+    }
+    m_hDevice = INVALID_HANDLE_VALUE;
+
+    // 2. 设备未加载，检查 sys 文件
     QFileInfo fi(sysFilePath);
     if (!fi.exists()) {
         if (errMsg) *errMsg = QStringLiteral("驱动文件不存在: ") + sysFilePath;
@@ -387,15 +406,7 @@ bool KernelDriver::installDriver(const QString& sysFilePath, QString* errMsg)
 
     m_driverPath = sysFilePath;
 
-    // 先尝试打开已加载的设备（可能上次加载后未卸载）
-    m_hDevice = getDriveHandle(m_driverName);
-    if (m_hDevice != INVALID_HANDLE_VALUE && m_hDevice != nullptr) {
-        qInfo() << "Driver already loaded, opened existing device handle";
-        if (errMsg) *errMsg = QStringLiteral("驱动已加载（复用现有实例）");
-        return true;
-    }
-
-    // 未加载，通过 NtLoadDriver 加载
+    // 3. 通过 NtLoadDriver 加载
     m_hDevice = loadDrive(sysFilePath, m_driverName);
 
     if (m_hDevice == INVALID_HANDLE_VALUE || m_hDevice == nullptr) {
@@ -558,6 +569,75 @@ QString KernelDriver::getProcessDosImageName(quint32 pid)
     return unicodeBytesToAnsi(buffer);
 }
 
+QVector<ThreadInfo> KernelDriver::enumThreadsByProcess(quint32 pid)
+{
+    // 驱动协议 (IOCTL_ENUMTHREADBYPROCESS, function=0x811):
+    //   输入:  HANDLE pid  (8 字节, 64位)
+    //   输出:  ULONG count + count × THREAD_OUTPUT_ENTRY { HANDLE Tid; PETHREAD EThread; }
+    //          每条目 16 字节 (64位), 驱动内部线程上限 8192
+    //   缓冲区不足: 返回 STATUS_BUFFER_TOO_SMALL, 输出首 ULONG = 所需字节数
+    QVector<ThreadInfo> result;
+    if (m_hDevice == INVALID_HANDLE_VALUE) return result;
+
+    const DWORD kMaxThreads = 8192;
+    const DWORD kEntrySize = 16;  // sizeof(HANDLE) + sizeof(PETHREAD) on x64
+    const DWORD kBufSize = sizeof(ULONG) + kMaxThreads * kEntrySize;
+
+    QByteArray buffer(kBufSize, '\0');
+    DWORD br = 0;
+    HANDLE pidIn = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid));
+    if (!deviceIoControl(IOCTL_ENUMTHREADBYPROCESS, &pidIn, sizeof(pidIn),
+                         buffer.data(), buffer.size(), &br)) {
+        return result;
+    }
+    if (br < sizeof(ULONG)) return result;
+
+    const ULONG count = *reinterpret_cast<const ULONG*>(buffer.constData());
+    if (count == 0 || count > kMaxThreads) return result;
+
+    const DWORD bytesNeeded = sizeof(ULONG) + count * kEntrySize;
+    if (br < bytesNeeded) return result;
+
+    const UCHAR* pEntries = reinterpret_cast<const UCHAR*>(buffer.constData()) + sizeof(ULONG);
+    result.reserve(count);
+    for (ULONG i = 0; i < count; ++i) {
+        const UCHAR* pEntry = pEntries + i * kEntrySize;
+        // THREAD_OUTPUT_ENTRY { HANDLE Tid (8B); PETHREAD EThread (8B) }
+        quint64 tidHandle = *reinterpret_cast<const quint64*>(pEntry);
+        quint64 ethread   = *reinterpret_cast<const quint64*>(pEntry + 8);
+        ThreadInfo info;
+        info.tid     = static_cast<quint32>(tidHandle);
+        info.ethread = ethread;
+        result.append(info);
+    }
+    return result;
+}
+
+QString KernelDriver::getDriverPathByEThread(quint64 ethread)
+{
+    // 驱动协议 (IOCTL_GETDRIVERPATCHBYETHREAD, function=0x812):
+    //   输入:  PETHREAD (8 字节, 64位内核地址)
+    //   输出:  WCHAR[] 驱动完整路径 (UTF-16, null 结尾), info = 字节长度
+    QString result;
+    if (m_hDevice == INVALID_HANDLE_VALUE) return result;
+    if (ethread == 0) return result;
+
+    QByteArray outBuf(2048, '\0');  // 驱动内部 buffer[1024] WCHAR = 2048 字节
+    DWORD br = 0;
+    quint64 ethreadIn = ethread;
+    if (!deviceIoControl(IOCTL_GETDRIVERPATCHBYETHREAD, &ethreadIn, sizeof(ethreadIn),
+                         outBuf.data(), outBuf.size(), &br)) {
+        return result;
+    }
+    if (br < sizeof(WCHAR)) return result;
+
+    int chars = br / sizeof(WCHAR);
+    if (chars > 0) {
+        result = QString::fromWCharArray(reinterpret_cast<const wchar_t*>(outBuf.constData()), chars);
+    }
+    return result;
+}
+
 // ===== 线程操作 =====
 
 bool KernelDriver::suspendThread(quint32 tid)
@@ -592,6 +672,16 @@ bool KernelDriver::pspTerminateThreadByPointer(quint64 tid, qint32 exitCode, boo
 bool KernelDriver::apcTerminateThread(quint32 tid)
 {
     return deviceIoControl(IOCTL_APCTERMINATETHREAD, &tid, sizeof(tid), nullptr, 0);
+}
+
+bool KernelDriver::apcTerminateThreadByEThread(quint64 ethread)
+{
+    // 驱动协议 (IOCTL_APCTERMINATETHREADBYETHREAD, function=0xA08):
+    //   输入: PETHREAD (8 字节, 64位内核地址)
+    //   输出: 无
+    if (ethread == 0) return false;
+    quint64 ethreadIn = ethread;
+    return deviceIoControl(IOCTL_APCTERMINATETHREADBYETHREAD, &ethreadIn, sizeof(ethreadIn), nullptr, 0);
 }
 
 // ===== 文件操作 =====
@@ -791,6 +881,92 @@ bool KernelDriver::flushMFT(const QString& driveLetter)
 {
     QByteArray uni = ansiToUnicodeBytes(driveLetter);
     return deviceIoControl(IOCTL_FLUSHMFT, uni.data(), uni.size(), nullptr, 0);
+}
+
+// ===== DirectNTFS 操作 =====
+// 驱动 NTFS 路径格式: \Windows\System32 (反斜杠开头, 相对卷根, 不含盘符)
+// 用户路径 C:\Windows\System32 -> NTFS 路径 \Windows\System32
+static QByteArray toNtfsPathBuffer(const QString& userPath)
+{
+    // 构造 4096 字节的 UTF-16 路径缓冲区 (NTFS_PATH_BUFFER_SIZE)
+    QString p = userPath;
+    // 去掉盘符前缀 "X:"
+    if (p.length() >= 2 && p[1] == QChar(':')) {
+        p = p.mid(2);
+    }
+    // 确保以 \ 开头
+    if (!p.startsWith(QChar('\\'))) {
+        p.prepend(QChar('\\'));
+    }
+    // 转为 UTF-16 字节
+    std::wstring ws = p.toStdWString();
+    QByteArray buf(4096, '\0');
+    int copyBytes = qMin<int>((int)(ws.size() * sizeof(wchar_t)), 4094);
+    memcpy(buf.data(), ws.c_str(), copyBytes);
+    // 确保结尾有双 null (UTF-16 null terminator)
+    return buf;
+}
+
+bool KernelDriver::ntfsInitVolume(wchar_t driveLetter)
+{
+    // 输入: WCHAR 盘符 (2 字节)
+    WCHAR dl = driveLetter;
+    return deviceIoControl(IOCTL_NTFS_INIT, &dl, sizeof(dl), nullptr, 0);
+}
+
+bool KernelDriver::ntfsReadFile(const QString& filePath, QByteArray& outData)
+{
+    // 输入: 4096 字节 UTF-16 路径
+    // 输出: 文件内容 (METHOD_BUFFERED, 输入输出共用 SystemBuffer, 驱动会先拷贝路径到本地)
+    // 最多读取 16MB, 超出部分截断
+    const DWORD kMaxRead = 16 * 1024 * 1024;
+    QByteArray pathBuf = toNtfsPathBuffer(filePath);
+    outData.resize(kMaxRead);
+    DWORD br = 0;
+    if (!deviceIoControl(IOCTL_NTFS_READFILE, pathBuf.data(), pathBuf.size(),
+                         outData.data(), outData.size(), &br)) {
+        outData.clear();
+        return false;
+    }
+    outData.resize(br);
+    return true;
+}
+
+bool KernelDriver::ntfsEnumDirectory(const QString& dirPath, QVector<NtfsDataInfo>& outList)
+{
+    // 输入: 路径 (UTF-16)
+    // 输出: NTFS_DATA_INFO 数组, 每项 2052 字节
+    outList.clear();
+    QByteArray pathBuf = toNtfsPathBuffer(dirPath);
+    // 最多 1024 项 (1024 * 2052 ≈ 2MB)
+    const int kMaxEntries = 1024;
+    const DWORD kEntrySize = sizeof(NtfsDataInfo);  // 2052
+    QByteArray outBuf(kMaxEntries * kEntrySize, '\0');
+    DWORD br = 0;
+    if (!deviceIoControl(IOCTL_NTFS_ENUMDIR, pathBuf.data(), pathBuf.size(),
+                         outBuf.data(), outBuf.size(), &br)) {
+        return false;
+    }
+    int count = br / kEntrySize;
+    const NtfsDataInfo* pEntries = reinterpret_cast<const NtfsDataInfo*>(outBuf.constData());
+    for (int i = 0; i < count; ++i) {
+        outList.append(pEntries[i]);
+    }
+    return true;
+}
+
+bool KernelDriver::ntfsCountDirectory(const QString& dirPath, NtfsFileFolderQuantity& outQty)
+{
+    // 输入: 路径 (UTF-16)
+    // 输出: NTFS_FILE_FOLDER_QUANTITY (20 字节)
+    QByteArray pathBuf = toNtfsPathBuffer(dirPath);
+    outQty = NtfsFileFolderQuantity();
+    DWORD br = 0;
+    if (!deviceIoControl(IOCTL_NTFS_GETQTY, pathBuf.data(), pathBuf.size(),
+                         &outQty, sizeof(outQty), &br)) {
+        return false;
+    }
+    return br >= sizeof(outQty);
 }
 
 // ===== 磁盘操作 =====

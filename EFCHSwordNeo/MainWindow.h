@@ -15,6 +15,7 @@ class StartupPage;
 class RegeditPage;
 class WinNTPage;
 class AboutPage;
+class SystemThreadPage;
 
 // 主窗口
 // 对应易语言: _启动窗口 (高级选择夹1 + 标签页)
@@ -52,6 +53,7 @@ private:
     RegeditPage* m_regeditPage = nullptr;
     WinNTPage* m_winntPage = nullptr;
     AboutPage* m_aboutPage = nullptr;
+    SystemThreadPage* m_systemThreadPage = nullptr;
 
     // 状态栏
     QLabel* m_statusVersion = nullptr;

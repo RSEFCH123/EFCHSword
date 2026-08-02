@@ -53,6 +53,31 @@ struct DataInfoAnsi {
     bool    isDirectory;
 };
 
+// 线程信息（驱动 IOCTL_ENUMTHREADBYPROCESS 输出）
+struct ThreadInfo {
+    quint32 tid = 0;       // 线程 ID
+    quint64 ethread = 0;   // 内核 ETHREAD 对象地址（0 表示无此信息，如 ToolHelp32 回退）
+};
+
+// NTFS 目录枚举结果项（对应驱动 NTFS_DATA_INFO, 2052 字节）
+#pragma pack(push, 1)
+struct NtfsDataInfo {
+    wchar_t name[1024];   // 文件/目录名 (UTF-16, null 结尾)
+    quint32 type;         // 0=文件 1=目录 2=系统元数据文件 3=系统元数据目录
+};
+#pragma pack(pop)
+
+// NTFS 目录数量统计（对应驱动 NTFS_FILE_FOLDER_QUANTITY, 20 字节）
+#pragma pack(push, 1)
+struct NtfsFileFolderQuantity {
+    quint32 fileCount;          // 普通文件数 (Type=0)
+    quint32 folderCount;        // 普通目录数 (Type=1)
+    quint32 systemFileCount;    // 系统元数据文件数 (Type=2)
+    quint32 systemFolderCount;  // 系统元数据目录数 (Type=3)
+    quint32 totalCount;         // 总数
+};
+#pragma pack(pop)
+
 // BSOD 颜色配置
 #pragma pack(push, 1)
 struct BsodColorConfig {
@@ -113,6 +138,12 @@ public:
     qint32 getPPL(quint32 pid);
     // 获取进程 DosImageName
     QString getProcessDosImageName(quint32 pid);
+    // 枚举进程线程（通过 EPROCESS 遍历 ThreadListEntry，可发现 PspCidTable 隐藏线程）
+    // 返回 ThreadInfo 列表（含 TID 和内核 ETHREAD 地址），失败返回空列表
+    QVector<ThreadInfo> enumThreadsByProcess(quint32 pid);
+    // 通过 ETHREAD 内核地址获取线程所属驱动的完整路径（IOCTL_GETDRIVERPATCHBYETHREAD）
+    // 失败返回空字符串
+    QString getDriverPathByEThread(quint64 ethread);
 
     // ===== 线程操作 =====
     bool suspendThread(quint32 tid);                    // NtSuspendThread
@@ -121,6 +152,8 @@ public:
     bool pspTerminateThreadByPointerEasy(quint32 tid);  // 简单版销毁线程
     bool pspTerminateThreadByPointer(quint64 tid, qint32 exitCode, bool directTerminate);
     bool apcTerminateThread(quint32 tid);
+    // 通过 ETHREAD 内核地址 APC 方式销毁线程（IOCTL_APCTERMINATETHREADBYETHREAD）
+    bool apcTerminateThreadByEThread(quint64 ethread);
 
     // ===== 文件操作 =====
     bool zwDeleteFile(const QString& ntFilePath);       // 路径需 \??\C:\xxx
@@ -143,6 +176,17 @@ public:
     bool irpQueryFileAndFolders(const QString& filePath, QVector<DataInfoAnsi>& outList);
     qint32 irpGetFileAndFolderQuantity(const QString& filePath);
     bool flushMFT(const QString& driveLetter);
+
+    // ===== DirectNTFS 操作 (直接解析 NTFS, 不经文件系统, 只读) =====
+    // 初始化指定盘符的 NTFS 卷上下文。driveLetter 如 'C'
+    bool ntfsInitVolume(wchar_t driveLetter);
+    // 读取文件内容。filePath 为相对卷根的路径如 "\Windows\System32\drivers\etc\hosts"
+    // 需先调用 ntfsInitVolume 初始化对应卷
+    bool ntfsReadFile(const QString& filePath, QByteArray& outData);
+    // 枚举目录。dirPath 为相对卷根路径如 "\Windows\System32"，根目录传 "\"
+    bool ntfsEnumDirectory(const QString& dirPath, QVector<NtfsDataInfo>& outList);
+    // 统计目录下文件/文件夹数量。dirPath 同上
+    bool ntfsCountDirectory(const QString& dirPath, NtfsFileFolderQuantity& outQty);
 
     // ===== 磁盘操作 =====
     bool writeDisk(quint64 startSector, quint64 sectorNumber, const QByteArray& data);

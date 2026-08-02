@@ -14,8 +14,8 @@
 #include <QMessageBox>
 #include <QApplication>
 
-FileReaderDialog::FileReaderDialog(const QString& filePath, QWidget* parent)
-    : QDialog(parent), m_filePath(filePath)
+FileReaderDialog::FileReaderDialog(const QString& filePath, QWidget* parent, bool useDirectNtfs)
+    : QDialog(parent), m_filePath(filePath), m_useDirectNtfs(useDirectNtfs)
 {
     setupUi();
     readFile();
@@ -79,21 +79,33 @@ void FileReaderDialog::readFile()
 {
     m_statusLabel->setText(QStringLiteral("正在读取..."));
 
-    QFileInfo fi(m_filePath);
-    if (!fi.exists()) {
-        m_statusLabel->setText(QStringLiteral("错误! 文件不存在!"));
-        return;
+    // DirectNTFS 模式下不需要文件存在检查 (文件可能被隐藏, QFileInfo 看不到)
+    if (!m_useDirectNtfs) {
+        QFileInfo fi(m_filePath);
+        if (!fi.exists()) {
+            m_statusLabel->setText(QStringLiteral("错误! 文件不存在!"));
+            return;
+        }
     }
 
     auto& ctx = AppContext::instance();
     bool ok = false;
     if (ctx.driverLoaded()) {
-        ok = ctx.driver().irpReadFile(m_filePath, m_fileData);
-        if (!ok) {
-            m_statusLabel->setText(QStringLiteral("错误! IrpReadFile 失败!"));
+        if (m_useDirectNtfs) {
+            // DirectNTFS 模式: 直接解析 NTFS 读取文件内容
+            ok = ctx.driver().ntfsReadFile(m_filePath, m_fileData);
+            if (!ok) {
+                m_statusLabel->setText(QStringLiteral("错误! NtfsReadFile 失败!"));
+            }
+        } else {
+            ok = ctx.driver().irpReadFile(m_filePath, m_fileData);
+            if (!ok) {
+                m_statusLabel->setText(QStringLiteral("错误! IrpReadFile 失败!"));
+            }
         }
     }
-    if (!ok || m_fileData.isEmpty()) {
+    // DirectNTFS 模式下不回退到 QFile (因为目的就是绕过文件系统)
+    if (!m_useDirectNtfs && (!ok || m_fileData.isEmpty())) {
         QFile f(m_filePath);
         if (f.open(QIODevice::ReadOnly)) {
             m_fileData = f.readAll();

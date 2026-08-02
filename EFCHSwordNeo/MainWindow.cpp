@@ -9,6 +9,7 @@
 #include "RegeditPage.h"
 #include "WinNTPage.h"
 #include "AboutPage.h"
+#include "SystemThreadPage.h"
 #include "ThemeManager.h"
 
 #include <QStatusBar>
@@ -53,6 +54,7 @@ void MainWindow::setupUi()
     // 导航项
     m_navList->addItem(QStringLiteral("  欢迎"));
     m_navList->addItem(QStringLiteral("  系统进程"));
+    m_navList->addItem(QStringLiteral("  系统线程"));
     m_navList->addItem(QStringLiteral("  窗口列表"));
     m_navList->addItem(QStringLiteral("  文件列表"));
     m_navList->addItem(QStringLiteral("  启动项"));
@@ -72,6 +74,7 @@ void MainWindow::setupUi()
     // 创建各页面
     m_welcomePage = new WelcomePage(this);
     m_processPage = new ProcessPage(this);
+    m_systemThreadPage = new SystemThreadPage(this);
     m_windowPage = new WindowPage(this);
     m_filePage = new FilePage(this);
     m_startupPage = new StartupPage(this);
@@ -82,6 +85,7 @@ void MainWindow::setupUi()
 
     m_stack->addWidget(m_welcomePage);
     m_stack->addWidget(m_processPage);
+    m_stack->addWidget(m_systemThreadPage);
     m_stack->addWidget(m_windowPage);
     m_stack->addWidget(m_filePage);
     m_stack->addWidget(m_startupPage);

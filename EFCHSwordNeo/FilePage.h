@@ -58,6 +58,8 @@ private:
     QString currentPath() const;
     QString selectedFilePath() const;
     bool isDirectoryRow(int row) const;
+    // DirectNTFS 模式下枚举目录 (绕过文件系统, 直接解析 NTFS)
+    bool browseToDirectNtfs(const QString& dir);
 
     QComboBox* m_driveCombo = nullptr;
     QLineEdit* m_pathEdit = nullptr;
@@ -68,6 +70,11 @@ private:
     QMenu* m_folderMenu = nullptr;
     QRadioButton* m_sortMixedRadio = nullptr;   // 文件名混排排序
     QRadioButton* m_sortFolderFirstRadio = nullptr;  // 文件夹优先排序
+    QRadioButton* m_modeIrpRadio = nullptr;        // IRP 模式
+    QRadioButton* m_modeDirectNtfsRadio = nullptr; // DirectNTFS 模式
+
+    // DirectNTFS 模式下已初始化的盘符, 避免重复初始化
+    QChar m_ntfsInitializedDrive;
 
     QString m_currentDir;
 

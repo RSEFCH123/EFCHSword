@@ -16,7 +16,7 @@ class FileReaderDialog : public QDialog
 {
     Q_OBJECT
 public:
-    explicit FileReaderDialog(const QString& filePath, QWidget* parent = nullptr);
+    explicit FileReaderDialog(const QString& filePath, QWidget* parent = nullptr, bool useDirectNtfs = false);
     ~FileReaderDialog() override;
 
 private slots:
@@ -29,6 +29,7 @@ private:
 
     QString m_filePath;
     QByteArray m_fileData;
+    bool m_useDirectNtfs = false;
 
     QPlainTextEdit* m_textEdit = nullptr;
     QRadioButton* m_modeText = nullptr;

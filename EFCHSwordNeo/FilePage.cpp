@@ -73,6 +73,16 @@ void FilePage::setupUi()
     sortGroup->addButton(m_sortMixedRadio);
     sortGroup->addButton(m_sortFolderFirstRadio);
 
+    // 文件操作模式: IRP (经文件系统) / DirectNTFS (直接解析NTFS, 只读)
+    m_modeIrpRadio = new QRadioButton(QStringLiteral("IRP"), this);
+    m_modeDirectNtfsRadio = new QRadioButton(QStringLiteral("DirectNTFS"), this);
+    m_modeIrpRadio->setChecked(true);  // 默认 IRP
+    m_modeDirectNtfsRadio->setToolTip(QStringLiteral("DirectNTFS: 绕过文件系统直接解析NTFS结构, "
+        "可读取被文件系统过滤驱动隐藏的文件, 但只支持读取(列出/阅读), 写入/删除等操作仍用IRP"));
+    auto* modeGroup = new QButtonGroup(this);
+    modeGroup->addButton(m_modeIrpRadio);
+    modeGroup->addButton(m_modeDirectNtfsRadio);
+
     connect(m_driveCombo, SIGNAL(currentIndexChanged(int)), this, SLOT(onDriveChanged(int)));
     connect(upBtn, &QPushButton::clicked, this, &FilePage::onUpClicked);
     connect(gotoBtn, &QPushButton::clicked, this, &FilePage::onGotoClicked);
@@ -81,6 +91,10 @@ void FilePage::setupUi()
     connect(m_pathEdit, &QLineEdit::returnPressed, this, &FilePage::onGotoClicked);
     connect(m_sortMixedRadio, &QRadioButton::toggled, this, &FilePage::onSortModeChanged);
     connect(m_sortFolderFirstRadio, &QRadioButton::toggled, this, &FilePage::onSortModeChanged);
+    // 切换操作模式时刷新当前目录
+    connect(m_modeIrpRadio, &QRadioButton::toggled, this, [this]() {
+        if (!m_currentDir.isEmpty()) browseTo(m_currentDir);
+    });
 
     toolLayout->addWidget(m_driveCombo);
     toolLayout->addWidget(upBtn);
@@ -91,6 +105,10 @@ void FilePage::setupUi()
     toolLayout->addWidget(new QLabel(QStringLiteral("排序:"), this));
     toolLayout->addWidget(m_sortMixedRadio);
     toolLayout->addWidget(m_sortFolderFirstRadio);
+    toolLayout->addSpacing(8);
+    toolLayout->addWidget(new QLabel(QStringLiteral("模式:"), this));
+    toolLayout->addWidget(m_modeIrpRadio);
+    toolLayout->addWidget(m_modeDirectNtfsRadio);
     mainLayout->addLayout(toolLayout);
 
     // 文件列表
@@ -273,6 +291,15 @@ void FilePage::browseTo(const QString& dir)
     auto& ctx = AppContext::instance();
     bool fastScan = m_fastScan->isChecked();
 
+    // DirectNTFS 模式: 绕过文件系统直接解析 NTFS (只读, 可发现被过滤驱动隐藏的文件)
+    if (m_modeDirectNtfsRadio->isChecked() && ctx.driverLoaded()) {
+        if (browseToDirectNtfs(m_currentDir)) {
+            return;
+        }
+        // DirectNTFS 失败 (非NTFS卷/驱动错误), 回退到 IRP/普通枚举
+        m_statusLabel->setText(QStringLiteral("DirectNTFS 失败, 回退到 IRP 模式"));
+    }
+
     // 获取文件列表
     QFileInfoList entries;
 
@@ -362,6 +389,105 @@ void FilePage::browseTo(const QString& dir)
 
     int fileCount = entries.size();
     m_statusLabel->setText(QStringLiteral("项目数: %1").arg(fileCount));
+}
+
+bool FilePage::browseToDirectNtfs(const QString& dir)
+{
+    // DirectNTFS 模式: 通过 IOCTL_NTFS_INIT + IOCTL_NTFS_ENUMDIR 列目录
+    // 返回 true 表示成功填充表格, false 表示失败 (调用方回退到 IRP)
+    auto& ctx = AppContext::instance();
+
+    // 提取盘符并初始化对应卷 (盘符变化时重新初始化)
+    QChar driveLetter = m_currentDir.isEmpty() ? QChar() : m_currentDir[0].toUpper();
+    if (driveLetter.isNull()) return false;
+
+    if (m_ntfsInitializedDrive != driveLetter) {
+        if (!ctx.driver().ntfsInitVolume(driveLetter.toLatin1())) {
+            return false;
+        }
+        m_ntfsInitializedDrive = driveLetter;
+    }
+
+    // 枚举目录
+    QVector<NtfsDataInfo> list;
+    if (!ctx.driver().ntfsEnumDirectory(m_currentDir, list)) {
+        return false;
+    }
+
+    // 转为 QFileInfo 列表并排序
+    QFileInfoList entries;
+    entries.reserve(list.size());
+    for (const auto& info : list) {
+        QString name = QString::fromWCharArray(info.name);
+        if (name.isEmpty()) continue;
+        // 跳过 . 和 ..
+        if (name == QStringLiteral(".") || name == QStringLiteral("..")) continue;
+        QFileInfo fi(m_currentDir + QStringLiteral("\\") + name);
+        entries.append(fi);
+    }
+
+    // 排序 (复用主排序逻辑)
+    if (m_sortFolderFirstRadio->isChecked()) {
+        std::sort(entries.begin(), entries.end(), [](const QFileInfo& a, const QFileInfo& b) {
+            // DirectNTFS 的 type 字段: 0=文件 1=目录 2=系统元数据文件 3=系统元数据目录
+            // 这里用 QFileInfo.isDir() 判断, 但 DirectNTFS 模式下文件可能无法通过 QFileInfo 获取属性
+            // 所以根据 NtfsDataInfo.type 判断更准确
+            bool aDir = a.isDir();
+            bool bDir = b.isDir();
+            if (aDir != bDir) return aDir;
+            return a.fileName().toLower() < b.fileName().toLower();
+        });
+    } else {
+        std::sort(entries.begin(), entries.end(), [](const QFileInfo& a, const QFileInfo& b) {
+            return a.fileName().toLower() < b.fileName().toLower();
+        });
+    }
+
+    m_table->setRowCount(entries.size());
+    bool fastScan = m_fastScan->isChecked();
+
+    for (int i = 0; i < entries.size(); ++i) {
+        const QFileInfo& fi = entries[i];
+        // 找到对应的 NtfsDataInfo 以获取 type
+        int type = -1;
+        for (const auto& info : list) {
+            if (QString::fromWCharArray(info.name) == fi.fileName()) {
+                type = (int)info.type;
+                break;
+            }
+        }
+
+        auto* nameItem = new QTableWidgetItem(fi.fileName());
+        nameItem->setIcon(iconForFile(fi));
+        m_table->setItem(i, FC_Name, nameItem);
+
+        // 类型 (优先用 DirectNTFS 返回的 type)
+        bool isDir = (type == 1 || type == 3) || (type == -1 && fi.isDir());
+        if (isDir) {
+            m_table->setItem(i, FC_Type, new QTableWidgetItem(
+                type == 3 ? QStringLiteral("系统目录") : QStringLiteral("文件夹")));
+        } else {
+            QString ext = fi.suffix().toLower();
+            if (ext == "exe") m_table->setItem(i, FC_Type, new QTableWidgetItem(QStringLiteral("应用程序")));
+            else if (ext == "dll") m_table->setItem(i, FC_Type, new QTableWidgetItem(QStringLiteral("应用程序扩展")));
+            else if (ext == "sys") m_table->setItem(i, FC_Type, new QTableWidgetItem(QStringLiteral("系统文件")));
+            else if (type == 2) m_table->setItem(i, FC_Type, new QTableWidgetItem(QStringLiteral("系统文件")));
+            else if (ext == "txt" || ext == "log") m_table->setItem(i, FC_Type, new QTableWidgetItem(QStringLiteral("文本文档")));
+            else m_table->setItem(i, FC_Type, new QTableWidgetItem(QStringLiteral("文件")));
+        }
+
+        // 大小 (DirectNTFS 模式下不单独查询文件大小, 留空)
+        m_table->setItem(i, FC_Size, new QTableWidgetItem(QStringLiteral("")));
+
+        // 时间 (DirectNTFS 不返回时间信息, 留空)
+        if (!fastScan) {
+            m_table->setItem(i, FC_Created, new QTableWidgetItem(fi.birthTime().toString(QStringLiteral("yyyy-MM-dd hh:mm:ss"))));
+            m_table->setItem(i, FC_Modified, new QTableWidgetItem(fi.lastModified().toString(QStringLiteral("yyyy-MM-dd hh:mm:ss"))));
+        }
+    }
+
+    m_statusLabel->setText(QStringLiteral("[DirectNTFS] 项目数: %1").arg(entries.size()));
+    return true;
 }
 
 QString FilePage::currentPath() const
@@ -749,7 +875,7 @@ void FilePage::onReadFile()
     QString path = selectedFilePath();
     if (path.isEmpty()) return;
 
-    FileReaderDialog dlg(path, this);
+    FileReaderDialog dlg(path, this, m_modeDirectNtfsRadio->isChecked());
     dlg.exec();
 }
 

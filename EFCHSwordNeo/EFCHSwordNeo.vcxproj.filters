@@ -75,6 +75,9 @@
     <QtMoc Include="DeleteDirProgressDialog.h">
       <Filter>Header Files</Filter>
     </QtMoc>
+    <QtMoc Include="SystemThreadPage.h">
+      <Filter>Header Files</Filter>
+    </QtMoc>
     <ClInclude Include="KernelDriver.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -136,6 +139,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="DeleteDirProgressDialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SystemThreadPage.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

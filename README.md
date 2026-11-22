@@ -126,8 +126,8 @@ EFCHSword 使用驱动级操作，实验性功能具有高度危险性，请谨�
 📌 系统要求  
 | 模式 | 最低系统 |
 |---|---|
-| 驱动模式（R0） | Windows 10 及以上 |
-| 无驱动模式（R3） | Windows 7 及以上 |  
+| 驱动模式（R0） | Neo: Windows 10 及以上 Classic: Windows 7 SP1 及以上 |
+| 无驱动模式（R3） | Neo: Windows 10 及以上 Classic: Windows 7 及以上 |  
   
 📦 相关项目  
 EFCHSword — 基于易语言开发，极致的自我保护与暴力对抗版本。  

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QObject>
 #include <QString>
@@ -30,8 +30,8 @@ public:
     void setSystemPartition(const QString& v) { m_systemPartition = v; }
 
     // 版本信息
-    QString version() const { return QStringLiteral("1.0.0 Neo"); }
-    QString betaVersion() const { return QStringLiteral("Neo"); }
+    QString version() const { return QStringLiteral("2.0.0"); }
+    QString betaVersion() const { return QStringLiteral("Neo 2.0.0"); }
 
     // Windows 版本信息
     int winMajor() const { return m_winMajor; }
@@ -75,6 +75,8 @@ private:
     bool enablePrivileges();
     void detectWindowsVersion();
     bool loadDriverFromResource();
+    // 强杀残留 EFCHSwordNeo 僵尸实例并重试卸载驱动（自愈，免重启）
+    bool killStaleInstancesAndRetryUnload();
 
     KernelDriver m_driver;
     bool m_driverLoaded = false;

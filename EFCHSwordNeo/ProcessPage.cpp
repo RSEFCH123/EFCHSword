@@ -1,4 +1,4 @@
-#include "ProcessPage.h"
+﻿#include "ProcessPage.h"
 #include "AppContext.h"
 #include "ProcessPropertiesDialog.h"
 
@@ -14,6 +14,7 @@
 #include <QAction>
 #include <QMessageBox>
 #include <QTimer>
+#include <QScrollBar>
 #include <QFileInfo>
 #include <QFileIconProvider>
 #include <QSet>
@@ -122,7 +123,10 @@ void ProcessPage::setupUi()
     m_tree->setAlternatingRowColors(true);
     m_tree->setRootIsDecorated(true);
     m_tree->setItemsExpandable(true);
-    m_tree->setAnimated(true);
+    // 2 秒自动刷新会整树重建, 开启动画时展开/收起动画与重建竞争,
+    // 行会出现视觉堆叠/错位, 这里必须关闭动画
+    m_tree->setAnimated(false);
+    m_tree->setUniformRowHeights(true);
     m_tree->setIconSize(QSize(16, 16));
     m_tree->header()->setStretchLastSection(false);
     m_tree->header()->setSectionResizeMode(Col_Name, QHeaderView::Stretch);
@@ -150,6 +154,15 @@ void ProcessPage::setupContextMenu()
 
     auto* forceKillAction = m_contextMenu->addAction(QStringLiteral("强制结束进程"));
     connect(forceKillAction, &QAction::triggered, this, &ProcessPage::onForceKillProcess);
+
+    // HVM(Ring-1) 相关处置合并到一个展开子菜单，避免右键菜单过长
+    auto* hvmMenu = m_contextMenu->addMenu(QStringLiteral("HVM 虚拟化处置"));
+    auto* hvmKillAction = hvmMenu->addAction(QStringLiteral("HVM强杀(#UD)"));
+    connect(hvmKillAction, &QAction::triggered, this, &ProcessPage::onHvmKillProcess);
+    auto* hvmFreezeAction = hvmMenu->addAction(QStringLiteral("HVM冻结(#PF)"));
+    connect(hvmFreezeAction, &QAction::triggered, this, &ProcessPage::onHvmFreezeProcess);
+    auto* hvmResumeAction = hvmMenu->addAction(QStringLiteral("HVM恢复"));
+    connect(hvmResumeAction, &QAction::triggered, this, &ProcessPage::onHvmResumeProcess);
 
     auto* suspendAction = m_contextMenu->addAction(QStringLiteral("挂起进程"));
     connect(suspendAction, &QAction::triggered, this, &ProcessPage::onSuspendProcess);
@@ -407,10 +420,17 @@ void ProcessPage::refreshProcesses()
         m_lastTotalTime = sysTotal;
     }
 
-    // ===== 7. 保存当前选中 =====
+    // ===== 7. 保存当前选中与滚动位置 =====
+    // 注意: PID 0 ([System Process]) 的选中状态也要恢复, 因此用
+    // "是否有选中" 标记而不是 selectedPid != 0 判断
+    bool hadSelection = m_tree->currentItem() != nullptr;
     quint32 selectedPid = currentPid();
+    int scrollPos = m_tree->verticalScrollBar() ? m_tree->verticalScrollBar()->value() : 0;
 
     // ===== 8. 记录展开状态 =====
+    // 注意: PID 0 (System Idle/[System Process]) 也必须记录, 否则每次
+    // 自动刷新(2秒)后该节点会被折叠回去 —— 这正是"展开后过两秒又
+    // 自动折回去"的根源
     QSet<quint32> expandedPids;
     for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
         QTreeWidgetItem* it = m_tree->topLevelItem(i);
@@ -421,7 +441,7 @@ void ProcessPage::refreshProcesses()
             if (cur->isExpanded()) {
                 bool ok = false;
                 quint32 pid = cur->text(Col_PID).toUInt(&ok);
-                if (ok && pid != 0) expandedPids.insert(pid);
+                if (ok) expandedPids.insert(pid);
             }
             for (int j = 0; j < cur->childCount(); ++j) {
                 stack.push(cur->child(j));
@@ -439,6 +459,9 @@ void ProcessPage::refreshProcesses()
     }
 
     // ===== 9. 构建树 =====
+    // 2 秒定时刷新会整树重建: 重建期间禁用重绘, 否则中间布局与展开/选中
+    // 恢复交错渲染, 行会出现视觉堆叠/错位
+    m_tree->setUpdatesEnabled(false);
     m_tree->clear();
     QHash<quint32, QTreeWidgetItem*> itemMap;
 
@@ -545,16 +568,15 @@ void ProcessPage::refreshProcesses()
     }
 
     // ===== 11. 恢复展开状态 =====
-    for (auto it = itemMap.constBegin(); it != itemMap.constEnd(); ++it) {
-        quint32 pid = it.key();
-        QTreeWidgetItem* item = it.value();
-        if (firstRefresh) {
-            // 首次刷新全部展开
-            m_tree->expandAll();
-            break;
-        }
-        if (expandedPids.contains(pid)) {
-            item->setExpanded(true);
+    if (firstRefresh) {
+        // 首次刷新全部展开
+        m_tree->expandAll();
+    }
+    else {
+        for (auto it = itemMap.constBegin(); it != itemMap.constEnd(); ++it) {
+            if (expandedPids.contains(it.key())) {
+                it.value()->setExpanded(true);
+            }
         }
     }
 
@@ -569,10 +591,17 @@ void ProcessPage::refreshProcesses()
     }
     m_statusLabel->setText(statusText);
 
-    // ===== 13. 恢复选中 =====
-    if (selectedPid != 0 && itemMap.contains(selectedPid)) {
+    // ===== 13. 恢复选中与滚动位置 =====
+    // 先恢复选中, 再统一恢复滚动位置; 重建期间重绘已禁用, 中间滚动不会绘制
+    if (hadSelection && itemMap.contains(selectedPid)) {
         m_tree->setCurrentItem(itemMap.value(selectedPid));
     }
+    if (m_tree->verticalScrollBar()) {
+        m_tree->verticalScrollBar()->setValue(scrollPos);
+    }
+
+    // 重建完成, 恢复重绘
+    m_tree->setUpdatesEnabled(true);
 }
 
 void ProcessPage::onRefreshClicked()
@@ -633,16 +662,25 @@ void ProcessPage::onItemDoubleClicked(QTreeWidgetItem* item, int col)
     onShowProcessProperties();
 }
 
+// 检测进程是否仍在运行（先声明供 killProcessWithFallback 使用）
+static bool IsProcessRunning(quint32 pid);
+
 void ProcessPage::killProcessWithFallback(quint32 pid)
 {
     auto& ctx = AppContext::instance();
 
     // 驱动结束进程：ZwKillProcess -> PspTerminateProcess -> ApcTerminateProcess
+    // 每一步之后都要确认进程是否已经退出：对正在退出/已退出的进程继续
+    // 插入终止 APC 会让 APC 落在销毁中的线程栈上，直接蓝屏。
     if (ctx.driverLoaded()) {
         ctx.driver().zwKillProcess(pid);
         Sleep(400);
+        if (!IsProcessRunning(pid)) return;
+
         ctx.driver().pspTerminateProcess(pid);
         Sleep(400);
+        if (!IsProcessRunning(pid)) return;
+
         ctx.driver().apcTerminateProcess(pid);
     } else {
         // 后备：用 TerminateProcess
@@ -795,6 +833,100 @@ void ProcessPage::onKillProcess()
         killProcessWithFallback(pid);
         QTimer::singleShot(500, this, &ProcessPage::refreshProcesses);
     }
+}
+
+// 把 HVM 处置结果翻译成一句人话。
+static QString hvmProcessStatusText(const KernelDriver::HvProcessResult& r, quint32 pid)
+{
+    if (r.status == 0) {
+        if (r.rows.isEmpty()) {
+            return QStringLiteral("处置已下达 PID %1（处置表为空，请重新下达）").arg(pid);
+        }
+        const auto& row = r.rows.first();
+        QString where = QStringLiteral("线性 0x%1 -> 物理 0x%2")
+            .arg(row.guestLinearAddress, 0, 16)
+            .arg(row.guestPhysicalAddress, 0, 16);
+        return QStringLiteral("处置已下达 PID %1（%2），拦截次数 %3")
+            .arg(pid)
+            .arg(where)
+            .arg(row.interceptCount);
+    }
+    QString reason;
+    switch (r.status) {
+    case 3:  reason = QStringLiteral("常驻未停止（驱动会自动停止/恢复，出现此状态说明停止失败）"); break;
+    case 4:  reason = QStringLiteral("目标进程解析失败（已退出或无地址空间）"); break;
+    case 7:  reason = QStringLiteral("该进程已有处置在生效"); break;
+    case 8:  reason = QStringLiteral("需要 CR3 跟踪（先启动一次 hypervisor 再试）"); break;
+    case 9:  reason = QStringLiteral("需要 EPTP 切换支持（当前 CPU 不支持执行-only EPT 叶）"); break;
+    case 10: reason = QStringLiteral("目标页翻译失败（进程可能正在退出）"); break;
+    case 11: reason = QStringLiteral("目标受保护（Idle/System/驱动自身）"); break;
+    case 12: reason = QStringLiteral("HVM 资源未准备"); break;
+    default: reason = QStringLiteral("状态码 %1 (NTSTATUS 0x%2)")
+                 .arg(r.status).arg((quint32)r.lastStatus, 8, 16, QLatin1Char('0')); break;
+    }
+    return QStringLiteral("HVM 处置失败：") + reason;
+}
+
+void ProcessPage::onHvmKillProcess()
+{
+    quint32 pid = currentPid();
+    if (pid == 0) return;
+    QString name = currentProcessName();
+    if (name.isEmpty()) name = QString::number(pid);
+
+    auto ret = QMessageBox::warning(this, QStringLiteral("EFCHSword"),
+        QStringLiteral("确定用 HVM 强杀进程: %1 吗?\nPID: %2\n\nRing-1 拒绝执行其关键页，命中后注入 #UD，"
+								"由系统走未处理异常结束进程。对驱动级保护进程有效，不可逆。\n\n"
+								"⚠️ 实验性功能：Intel 平台上处置命中瞬间可能整机死机（上游 KSword 同样存在，"
+								"该路径仅在 AMD 上验证过）。请保存所有工作后再继续！").arg(name).arg(pid),
+        QMessageBox::Yes | QMessageBox::No);
+    if (ret != QMessageBox::Yes) return;
+
+    auto& driver = AppContext::instance().driver();
+    KernelDriver::HvProcessResult r;
+    const bool ok = driver.hvmTerminateProcess(pid, 0, &r);
+    QMessageBox::information(this, QStringLiteral("EFCHSword"),
+        ok ? hvmProcessStatusText(r, pid)
+           : QStringLiteral("IOCTL 失败（驱动未加载或版本过旧，Win32 错误 %1）")
+               .arg(driver.lastIoError()));
+    QTimer::singleShot(800, this, &ProcessPage::refreshProcesses);
+}
+
+void ProcessPage::onHvmFreezeProcess()
+{
+    quint32 pid = currentPid();
+    if (pid == 0) return;
+    QString name = currentProcessName();
+    if (name.isEmpty()) name = QString::number(pid);
+
+    auto ret = QMessageBox::warning(this, QStringLiteral("EFCHSword"),
+        QStringLiteral("确定用 HVM 冻结进程: %1 吗?\nPID: %2\n\nRing-1 拒绝执行其关键页，"
+								"命中后注入 #PF，进程原地卡死；可用 HVM恢复 撤销。\n\n"
+								"⚠️ 实验性功能：Intel 平台上处置命中瞬间可能整机死机（上游 KSword 同样存在，"
+								"该路径仅在 AMD 上验证过）。请保存所有工作后再继续！").arg(name).arg(pid),
+        QMessageBox::Yes | QMessageBox::No);
+    if (ret != QMessageBox::Yes) return;
+
+    auto& driver = AppContext::instance().driver();
+    KernelDriver::HvProcessResult r;
+    const bool ok = driver.hvmFreezeProcess(pid, 0, &r);
+    QMessageBox::information(this, QStringLiteral("EFCHSword"),
+        ok ? hvmProcessStatusText(r, pid)
+           : QStringLiteral("IOCTL 失败（驱动未加载或版本过旧，Win32 错误 %1）")
+               .arg(driver.lastIoError()));
+}
+
+void ProcessPage::onHvmResumeProcess()
+{
+    quint32 pid = currentPid();
+    if (pid == 0) return;
+
+    auto& driver = AppContext::instance().driver();
+    KernelDriver::HvProcessResult r;
+    const bool ok = driver.hvmResumeProcess(pid, &r);
+    QMessageBox::information(this, QStringLiteral("EFCHSword"),
+        ok ? QStringLiteral("PID %1 的 HVM 处置已撤销，地址空间切回基座后恢复执行。").arg(pid)
+           : hvmProcessStatusText(r, pid));
 }
 
 void ProcessPage::onSuspendProcess()

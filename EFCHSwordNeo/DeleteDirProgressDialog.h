@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QWidget>
 #include <QString>
@@ -58,9 +58,11 @@ private:
             return ctx.driver().forceDeleteFile(path);
         } else if (m_mode == 1) {
             return ctx.driver().posixForceDeleteFile(path);
-        } else { // m_mode == 2
+        } else if (m_mode == 2) {
             QString ntPath = QStringLiteral("\\??\\") + path;
             return ctx.driver().zwDeleteFile(ntPath);
+        } else { // m_mode == 3, NTFS 直接删除
+            return ctx.driver().ntfsDeleteFile(path);
         }
     }
 
@@ -120,6 +122,7 @@ private:
 //   0 = ForceDeleteFile (IRP 暴力删除)
 //   1 = POSIXForceDeleteFile
 //   2 = ZwDeleteFile
+//   3 = NtfsDeleteFile (直接解析 NTFS 删除, 绕过文件系统)
 class DeleteDirProgressDialog : public QWidget
 {
     Q_OBJECT

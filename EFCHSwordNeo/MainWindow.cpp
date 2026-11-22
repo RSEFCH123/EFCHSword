@@ -1,4 +1,6 @@
-#include "MainWindow.h"
+﻿#include "MainWindow.h"
+#include "KernelPage.h"        // 必须在 AppContext.h(windows.h) 之前: winsock2 顺序
+#include "NetMonitorPage.h"    // 同上 (NetTable.h -> winsock2.h)
 #include "AppContext.h"
 #include "WelcomePage.h"
 #include "ProcessPage.h"
@@ -10,6 +12,9 @@
 #include "WinNTPage.h"
 #include "AboutPage.h"
 #include "SystemThreadPage.h"
+#include "ProcessBehaviorPage.h"
+#include "EtwMonitorPage.h"
+#include "HypervisorPage.h"
 #include "ThemeManager.h"
 
 #include <QStatusBar>
@@ -55,12 +60,17 @@ void MainWindow::setupUi()
     m_navList->addItem(QStringLiteral("  欢迎"));
     m_navList->addItem(QStringLiteral("  系统进程"));
     m_navList->addItem(QStringLiteral("  系统线程"));
+    m_navList->addItem(QStringLiteral("  行为监视"));
+    m_navList->addItem(QStringLiteral("  ETW 监视"));
     m_navList->addItem(QStringLiteral("  窗口列表"));
     m_navList->addItem(QStringLiteral("  文件列表"));
-    m_navList->addItem(QStringLiteral("  启动项"));
+    m_navList->addItem(QStringLiteral("  启动项/服务"));
     m_navList->addItem(QStringLiteral("  工具"));
     m_navList->addItem(QStringLiteral("  注册表"));
     m_navList->addItem(QStringLiteral("  WinNT"));
+    m_navList->addItem(QStringLiteral("  内核"));
+    m_navList->addItem(QStringLiteral("  Hypervisor"));
+    m_navList->addItem(QStringLiteral("  网络监控"));
     m_navList->addItem(QStringLiteral("  关于"));
 
     for (int i = 0; i < m_navList->count(); ++i) {
@@ -75,23 +85,33 @@ void MainWindow::setupUi()
     m_welcomePage = new WelcomePage(this);
     m_processPage = new ProcessPage(this);
     m_systemThreadPage = new SystemThreadPage(this);
+    m_behaviorPage = new ProcessBehaviorPage(this);
+    m_etwPage = new EtwMonitorPage(this);
     m_windowPage = new WindowPage(this);
     m_filePage = new FilePage(this);
     m_startupPage = new StartupPage(this);
     m_toolsPage = new ToolsPage(this);
     m_regeditPage = new RegeditPage(this);
     m_winntPage = new WinNTPage(this);
+    m_kernelPage = new KernelPage(this);
+    m_hypervisorPage = new HypervisorPage(this);
+    m_netMonitorPage = new NetMonitorPage(this);
     m_aboutPage = new AboutPage(this);
 
     m_stack->addWidget(m_welcomePage);
     m_stack->addWidget(m_processPage);
     m_stack->addWidget(m_systemThreadPage);
+    m_stack->addWidget(m_behaviorPage);
+    m_stack->addWidget(m_etwPage);
     m_stack->addWidget(m_windowPage);
     m_stack->addWidget(m_filePage);
     m_stack->addWidget(m_startupPage);
     m_stack->addWidget(m_toolsPage);
     m_stack->addWidget(m_regeditPage);
     m_stack->addWidget(m_winntPage);
+    m_stack->addWidget(m_kernelPage);
+    m_stack->addWidget(m_hypervisorPage);
+    m_stack->addWidget(m_netMonitorPage);
     m_stack->addWidget(m_aboutPage);
 
     mainLayout->addWidget(m_navList);
@@ -115,11 +135,13 @@ void MainWindow::setupStatusBar()
     m_statusProcessCount = new QLabel(QStringLiteral("进程数: 0"), this);
     m_statusCpu = new QLabel(QStringLiteral("CPU: 0%"), this);
     m_statusMemory = new QLabel(QStringLiteral("内存: 0%"), this);
+    m_statusDriverVer = new QLabel(QStringLiteral("驱动: -"), this);
     m_statusVersion = new QLabel(QStringLiteral("版本: ") + ctx.version(), this);
 
     sb->addWidget(m_statusProcessCount);
     sb->addWidget(m_statusCpu);
     sb->addWidget(m_statusMemory);
+    sb->addWidget(m_statusDriverVer);
     sb->addPermanentWidget(m_statusVersion);
 
     // 定时更新状态栏
@@ -139,6 +161,14 @@ void MainWindow::setupStatusBar()
         EnumProcesses(nullptr, 0, &needed);
         count = needed / sizeof(DWORD);
         m_statusProcessCount->setText(QStringLiteral("进程数: %1").arg(count));
+
+        // 驱动版本（排查旧驱动残留）
+        if (AppContext::instance().driverLoaded()) {
+            m_statusDriverVer->setText(QStringLiteral("驱动: %1")
+                .arg(AppContext::instance().driver().getDriverVersion()));
+        } else {
+            m_statusDriverVer->setText(QStringLiteral("驱动: 未加载"));
+        }
     });
     timer->start();
 }

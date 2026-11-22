@@ -1,4 +1,4 @@
-#include "FilePage.h"
+﻿#include "FilePage.h"
 #include "AppContext.h"
 #include "FilePropertiesDialog.h"
 #include "FileReaderDialog.h"
@@ -28,10 +28,13 @@
 #include <QFileIconProvider>
 #include <QRadioButton>
 #include <QButtonGroup>
+#include <QDialog>
 #include <algorithm>
 
 #include <windows.h>
 #include <shellapi.h>
+#include <psapi.h>
+#include <tlhelp32.h>
 
 // 文件列
 enum FileColumn {
@@ -122,7 +125,8 @@ void FilePage::setupUi()
         QStringLiteral("修改时间")
     });
     m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
-    m_table->setSelectionMode(QAbstractItemView::SingleSelection);
+    // 多选: Ctrl+单击追加/移除, Shift+单击范围选择, Ctrl+A 全选
+    m_table->setSelectionMode(QAbstractItemView::ExtendedSelection);
     m_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_table->setContextMenuPolicy(Qt::CustomContextMenu);
     m_table->setAlternatingRowColors(true);
@@ -184,6 +188,10 @@ void FilePage::setupContextMenu()
     auto* zwDeleteAction = m_contextMenu->addAction(QStringLiteral("ZwDeleteFile (NT路径)"));
     connect(zwDeleteAction, &QAction::triggered, this, &FilePage::onZwDeleteFile);
 
+    m_ntfsDeleteAction = m_contextMenu->addAction(QStringLiteral("NTFS 直接删除"));
+    m_ntfsDeleteAction->setToolTip(QStringLiteral("通过直接解析 NTFS 结构删除文件/目录, 绕过文件系统过滤驱动"));
+    connect(m_ntfsDeleteAction, &QAction::triggered, this, &FilePage::onNtfsDelete);
+
     m_contextMenu->addSeparator();
 
     auto* protectAction = m_contextMenu->addAction(QStringLiteral("保护此文件 (占用)"));
@@ -191,6 +199,10 @@ void FilePage::setupContextMenu()
 
     auto* forceOccupyAction = m_contextMenu->addAction(QStringLiteral("强制占用文件"));
     connect(forceOccupyAction, &QAction::triggered, this, &FilePage::onForceOccupyFile);
+
+    auto* scanOccupyAction = m_contextMenu->addAction(QStringLiteral("扫描文件占用 (内核)"));
+    scanOccupyAction->setToolTip(QStringLiteral("通过内核句柄表扫描正在占用此文件的进程"));
+    connect(scanOccupyAction, &QAction::triggered, this, &FilePage::onScanOccupy);
 
     m_contextMenu->addSeparator();
 
@@ -210,6 +222,10 @@ void FilePage::setupContextMenu()
     m_folderMenu->addAction(renameAction);
     m_folderMenu->addAction(deleteAction);
     m_folderMenu->addAction(forceDeleteAction);
+    m_folderMenu->addAction(posixDeleteAction);
+    m_folderMenu->addAction(m_ntfsDeleteAction);
+    m_folderMenu->addSeparator();
+    m_folderMenu->addAction(scanOccupyAction);
     m_folderMenu->addSeparator();
     m_folderMenu->addAction(explorerMenuAction);
     m_folderMenu->addAction(propsAction);
@@ -512,6 +528,24 @@ QString FilePage::selectedFilePath() const
     return path;
 }
 
+QStringList FilePage::selectedFilePaths() const
+{
+    QStringList paths;
+    const QList<QTableWidgetItem*> items = m_table->selectedItems();
+    for (auto* item : items) {
+        if (item->column() != FC_Name) continue;
+        QString name = item->text();
+        if (name == QStringLiteral(".") || name == QStringLiteral("..")) continue;
+        if (paths.contains(name)) continue;
+
+        QString path = m_currentDir;
+        if (!path.endsWith('\\')) path += '\\';
+        path += name;
+        paths.append(path);
+    }
+    return paths;
+}
+
 bool FilePage::isDirectoryRow(int row) const
 {
     if (row < 0) return false;
@@ -643,99 +677,106 @@ void FilePage::onRename()
 
 void FilePage::onDeleteNormal()
 {
-    QString path = selectedFilePath();
-    if (path.isEmpty()) return;
+    QStringList paths = selectedFilePaths();
+    if (paths.isEmpty()) return;
 
-    if (QMessageBox::warning(this, QStringLiteral("EFCHSword"),
-            QStringLiteral("确定删除: %1 吗?").arg(path),
+    QString msg = (paths.size() == 1)
+        ? QStringLiteral("确定删除: %1 吗?").arg(paths.first())
+        : QStringLiteral("确定删除选中的 %1 个项目吗?").arg(paths.size());
+    if (QMessageBox::warning(this, QStringLiteral("EFCHSword"), msg,
             QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) return;
 
-    QFileInfo fi(path);
-    bool ok = false;
-    if (fi.isDir()) {
-        ok = QDir(path).removeRecursively();
-    } else {
-        ok = QFile::remove(path);
+    QStringList failed;
+    for (const QString& path : paths) {
+        QFileInfo fi(path);
+        bool ok = false;
+        if (fi.isDir()) {
+            ok = QDir(path).removeRecursively();
+        } else {
+            ok = QFile::remove(path);
+        }
+        if (!ok) failed.append(path);
     }
 
-    if (!ok) {
+    if (!failed.isEmpty()) {
         QMessageBox::warning(this, QStringLiteral("EFCHSword"),
-            QStringLiteral("删除失败!") + QStringLiteral("\n错误码: ") + QString::number(GetLastError()));
+            QStringLiteral("删除失败!\n错误码: %1\n\n失败项:\n%2")
+                .arg(GetLastError()).arg(failed.join(QStringLiteral("\n"))));
+    }
+    browseTo(m_currentDir);
+}
+
+// 多选删除公共流程: 确认后逐项删除, 文件夹弹递归删除进度对话框
+// mode: 0=IRP强制删除 1=POSIX 2=ZwDeleteFile
+void FilePage::deleteSelectedItems(int mode, const QString& title)
+{
+    QStringList paths = selectedFilePaths();
+    if (paths.isEmpty()) return;
+
+    auto& ctx = AppContext::instance();
+    if (!ctx.driverLoaded()) {
+        QMessageBox::warning(this, QStringLiteral("EFCHSword"), QStringLiteral("驱动未加载"));
+        return;
+    }
+
+    QString msg = (paths.size() == 1)
+        ? QStringLiteral("%1不可恢复!确定删除: %2 吗?").arg(title).arg(paths.first())
+        : QStringLiteral("%1不可恢复!确定删除选中的 %2 个项目吗?").arg(title).arg(paths.size());
+    if (QMessageBox::warning(this, QStringLiteral("警告"), msg,
+            QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) return;
+
+    QStringList failed;
+    for (const QString& path : paths) {
+        QFileInfo fi(path);
+        if (fi.isDir()) {
+            // 文件夹：弹出进度对话框，工作线程递归删除（异步）
+            auto* dlg = new DeleteDirProgressDialog(path, mode, this);
+            dlg->setAttribute(Qt::WA_DeleteOnClose);
+            dlg->setWindowFlag(Qt::Window);
+            // 关闭时刷新文件列表
+            connect(dlg, &DeleteDirProgressDialog::finished, this, [this](bool) {
+                browseTo(m_currentDir);
+            });
+            dlg->show();
+        } else {
+            bool ok = false;
+            if (mode == 0) {
+                ok = ctx.driver().forceDeleteFile(path);
+            } else if (mode == 1) {
+                ok = ctx.driver().posixForceDeleteFile(path);
+            } else {
+                ok = ctx.driver().zwDeleteFile(QStringLiteral("\\??\\") + path);
+            }
+            if (!ok) failed.append(path);
+        }
+    }
+
+    if (!failed.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("EFCHSword"),
+            QStringLiteral("%1删除失败!\n\n失败项:\n%2").arg(title).arg(failed.join(QStringLiteral("\n"))));
     }
     browseTo(m_currentDir);
 }
 
 void FilePage::onForceDelete()
 {
-    QString path = selectedFilePath();
-    if (path.isEmpty()) return;
-
-    auto& ctx = AppContext::instance();
-    if (!ctx.driverLoaded()) {
-        QMessageBox::warning(this, QStringLiteral("EFCHSword"), QStringLiteral("驱动未加载，无法使用强制删除"));
-        return;
-    }
-
-    if (QMessageBox::warning(this, QStringLiteral("警告"),
-            QStringLiteral("强制删除不可恢复!确定删除: %1 吗?").arg(path),
-            QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) return;
-
-    QFileInfo fi(path);
-    if (fi.isDir()) {
-        // 文件夹：弹出进度对话框，工作线程递归删除
-        auto* dlg = new DeleteDirProgressDialog(path, 0, this);
-        dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setWindowFlag(Qt::Window);
-        // 关闭时刷新文件列表
-        connect(dlg, &DeleteDirProgressDialog::finished, this, [this](bool) {
-            browseTo(m_currentDir);
-        });
-        dlg->show();
-    } else {
-        bool ok = ctx.driver().forceDeleteFile(path);
-        if (!ok) {
-            QMessageBox::warning(this, QStringLiteral("EFCHSword"), QStringLiteral("强制删除失败!"));
-        }
-        browseTo(m_currentDir);
-    }
+    deleteSelectedItems(0, QStringLiteral("强制删除"));
 }
 
 void FilePage::onPosixForceDelete()
 {
-    QString path = selectedFilePath();
-    if (path.isEmpty()) return;
-
-    auto& ctx = AppContext::instance();
-    if (!ctx.driverLoaded()) {
-        QMessageBox::warning(this, QStringLiteral("EFCHSword"), QStringLiteral("驱动未加载"));
-        return;
-    }
-
-    if (QMessageBox::warning(this, QStringLiteral("警告"),
-            QStringLiteral("POSIX强制删除不可恢复!确定删除: %1 吗?").arg(path),
-            QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) return;
-
-    QFileInfo fi(path);
-    if (fi.isDir()) {
-        // POSIX 模式同样支持文件夹递归删除
-        auto* dlg = new DeleteDirProgressDialog(path, 1, this);
-        dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setWindowFlag(Qt::Window);
-        connect(dlg, &DeleteDirProgressDialog::finished, this, [this](bool) {
-            browseTo(m_currentDir);
-        });
-        dlg->show();
-    } else {
-        bool ok = ctx.driver().posixForceDeleteFile(path);
-        if (!ok) {
-            QMessageBox::warning(this, QStringLiteral("EFCHSword"), QStringLiteral("POSIX删除失败!"));
-        }
-        browseTo(m_currentDir);
-    }
+    deleteSelectedItems(1, QStringLiteral("POSIX强制删除"));
 }
 
 void FilePage::onZwDeleteFile()
 {
+    deleteSelectedItems(2, QStringLiteral("ZwDeleteFile"));
+}
+
+void FilePage::onNtfsDelete()
+{
+    // NTFS 直接删除: 通过解析 NTFS 结构删除文件/目录, 绕过文件系统过滤驱动
+    // 要求: 驱动已加载, 且目标所在卷已通过 ntfsInitVolume 初始化 (DirectNTFS 模式下浏览时已初始化)
     QString path = selectedFilePath();
     if (path.isEmpty()) return;
 
@@ -746,13 +787,32 @@ void FilePage::onZwDeleteFile()
     }
 
     if (QMessageBox::warning(this, QStringLiteral("警告"),
-            QStringLiteral("ZwDeleteFile删除不可恢复!确定删除: %1 吗?").arg(path),
+            QStringLiteral("NTFS直接删除通过解析NTFS结构绕过文件系统, 不可恢复!\n"
+                           "确定删除: %1 吗?").arg(path),
             QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) return;
+
+    // 确保目标卷已初始化 (若未初始化, 用路径首字母作为盘符初始化)
+    QChar driveLetter = path.isEmpty() ? QChar() : path[0].toUpper();
+    if (driveLetter.isNull() || !driveLetter.isLetter()) {
+        QMessageBox::warning(this, QStringLiteral("EFCHSword"), QStringLiteral("无效的路径"));
+        return;
+    }
+    // 若当前已初始化的盘符与目标盘符不同, 重新初始化
+    // (DirectNTFS 模式浏览时 m_ntfsInitializedDrive 会记录, IRP 模式下可能未初始化)
 
     QFileInfo fi(path);
     if (fi.isDir()) {
-        // ZwDeleteFile 模式同样支持文件夹递归删除
-        auto* dlg = new DeleteDirProgressDialog(path, 2, this);
+        // 目录: 递归删除 (mode=3 = NTFS 直接删除)
+        // 先确保 NTFS 卷已初始化
+        if (m_ntfsInitializedDrive != driveLetter) {
+            if (!ctx.driver().ntfsInitVolume(driveLetter.toLatin1())) {
+                QMessageBox::warning(this, QStringLiteral("EFCHSword"),
+                    QStringLiteral("NTFS 卷初始化失败, 可能该卷不是 NTFS 格式"));
+                return;
+            }
+            m_ntfsInitializedDrive = driveLetter;
+        }
+        auto* dlg = new DeleteDirProgressDialog(path, 3, this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
         dlg->setWindowFlag(Qt::Window);
         connect(dlg, &DeleteDirProgressDialog::finished, this, [this](bool) {
@@ -760,11 +820,19 @@ void FilePage::onZwDeleteFile()
         });
         dlg->show();
     } else {
-        // ZwDeleteFile 需要 NT 路径: \??\C:\xxx
-        QString ntPath = QStringLiteral("\\??\\") + path;
-        bool ok = ctx.driver().zwDeleteFile(ntPath);
+        // 文件: 单次 NTFS 删除
+        if (m_ntfsInitializedDrive != driveLetter) {
+            if (!ctx.driver().ntfsInitVolume(driveLetter.toLatin1())) {
+                QMessageBox::warning(this, QStringLiteral("EFCHSword"),
+                    QStringLiteral("NTFS 卷初始化失败, 可能该卷不是 NTFS 格式"));
+                return;
+            }
+            m_ntfsInitializedDrive = driveLetter;
+        }
+        bool ok = ctx.driver().ntfsDeleteFile(path);
         if (!ok) {
-            QMessageBox::warning(this, QStringLiteral("EFCHSword"), QStringLiteral("ZwDeleteFile失败!"));
+            QMessageBox::warning(this, QStringLiteral("EFCHSword"),
+                QStringLiteral("NTFS 删除失败! 错误码: %1").arg(ctx.driver().lastIoError()));
         }
         browseTo(m_currentDir);
     }
@@ -868,6 +936,208 @@ void FilePage::onForceOccupyFile()
     } else {
         QMessageBox::information(this, QStringLiteral("EFCHSword"), QStringLiteral("文件已强制占用"));
     }
+}
+
+void FilePage::onScanOccupy()
+{
+    QString path = selectedFilePath();
+    if (path.isEmpty()) return;
+
+    auto& ctx = AppContext::instance();
+    if (!ctx.driverLoaded()) {
+        QMessageBox::warning(this, QStringLiteral("EFCHSword"),
+            QStringLiteral("驱动未加载, 文件占用扫描需要内核驱动"));
+        return;
+    }
+
+    // DOS 路径 -> NT 路径
+    QString ntPath = QStringLiteral("\\??\\") + path;
+    if (ntPath.contains(QLatin1Char('/'))) ntPath.replace(QLatin1Char('/'), QLatin1Char('\\'));
+
+    // ArkOccupyArray 约 50KB, 可栈分配
+    ArkOccupyArray arr;
+    if (!ctx.driver().scanFileOccupy(ntPath, arr)) {
+        QMessageBox::warning(this, QStringLiteral("EFCHSword"),
+            QStringLiteral("占用扫描失败 (错误码: %1)").arg(ctx.driver().lastIoError()));
+        return;
+    }
+
+    // ===== R3 补充：正在运行的进程映像本身 / 已加载模块（句柄表里没有,
+    // 是通过映像 Section 引用的, 内核句柄扫描天然扫不到）=====
+    struct ImageMatch { quint32 pid; QString name; QString hint; };
+    QVector<ImageMatch> imageMatches;
+    {
+        QString targetNorm = QDir::toNativeSeparators(path).toLower();
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe;
+            pe.dwSize = sizeof(pe);
+            if (Process32FirstW(hSnap, &pe)) {
+                do {
+                    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+                    if (!hProc) continue;
+                    wchar_t imgPath[MAX_PATH] = {0};
+                    DWORD len = MAX_PATH;
+                    bool gotPath = QueryFullProcessImageNameW(hProc, 0, imgPath, &len) != 0;
+                    CloseHandle(hProc);
+                    if (!gotPath) continue;
+                    QString p = QString::fromWCharArray(imgPath);
+                    if (p.toLower() == targetNorm) {
+                        imageMatches.append({(quint32)pe.th32ProcessID,
+                            QString::fromWCharArray(pe.szExeFile),
+                            QStringLiteral("进程主映像 (正在运行)")});
+                        continue;
+                    }
+                    // 已加载 DLL 模块匹配
+                    HANDLE hMod = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
+                    if (hMod) {
+                        HMODULE mods[1024];
+                        DWORD needed = 0;
+                        if (EnumProcessModulesEx(hMod, mods, sizeof(mods), &needed, LIST_MODULES_ALL) &&
+                            needed <= sizeof(mods)) {
+                            DWORD count = needed / sizeof(HMODULE);
+                            for (DWORD m = 0; m < count; ++m) {
+                                wchar_t modPath[MAX_PATH] = {0};
+                                if (GetModuleFileNameExW(hMod, mods[m], modPath, MAX_PATH) &&
+                                    QString::fromWCharArray(modPath).toLower() == targetNorm) {
+                                    imageMatches.append({(quint32)pe.th32ProcessID,
+                                        QString::fromWCharArray(pe.szExeFile),
+                                        QStringLiteral("已加载模块 (DLL/映像 Section)")});
+                                    break;
+                                }
+                            }
+                        }
+                        CloseHandle(hMod);
+                    }
+                } while (Process32NextW(hSnap, &pe));
+            }
+            CloseHandle(hSnap);
+        }
+    }
+
+    // 结果对话框
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("文件占用扫描 - %1").arg(path));
+    dlg.resize(760, 480);
+    auto* layout = new QVBoxLayout(&dlg);
+
+    int total = arr.count + imageMatches.size();
+    auto* infoLabel = new QLabel(
+        total == 0
+            ? QStringLiteral("没有进程占用此文件。")
+            : QStringLiteral("发现 %1 个占用 (其中句柄 %2 个, 映像引用 %3 个):")
+                .arg(total).arg(arr.count).arg(imageMatches.size()), &dlg);
+    layout->addWidget(infoLabel);
+
+    auto* table = new QTableWidget(&dlg);
+    table->setColumnCount(5);
+    table->setHorizontalHeaderLabels({
+        QStringLiteral("PID"), QStringLiteral("进程名"), QStringLiteral("句柄"),
+        QStringLiteral("访问权限"), QStringLiteral("文件对象")});
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->verticalHeader()->setVisible(false);
+    table->horizontalHeader()->setStretchLastSection(true);
+    layout->addWidget(table, 1);
+
+    // 访问权限 -> 字符串
+    auto accessToString = [](quint32 a) {
+        QStringList s;
+        if (a & 0x00010000) s << QStringLiteral("删除");
+        if (a & 0x00020000) s << QStringLiteral("读控制");
+        if (a & 0x00040000) s << QStringLiteral("写DACL");
+        if (a & 0x00080000) s << QStringLiteral("写所有者");
+        if (a & 0x00100000) s << QStringLiteral("同步");
+        if (a & 0x00000001) s << QStringLiteral("读数据");
+        if (a & 0x00000002) s << QStringLiteral("写数据");
+        if (a & 0x00000004) s << QStringLiteral("追加");
+        if (a & 0x00000008) s << QStringLiteral("读EA");
+        if (a & 0x00000010) s << QStringLiteral("写EA");
+        if (a & 0x00000020) s << QStringLiteral("执行");
+        if (a & 0x00000040) s << QStringLiteral("删除子项");
+        if (a & 0x00000080) s << QStringLiteral("读属性");
+        if (a & 0x00000100) s << QStringLiteral("写属性");
+        if (s.isEmpty()) s << QStringLiteral("0x%1").arg(a, 8, 16, QChar('0'));
+        return s.join(QStringLiteral(" | "));
+    };
+
+    // 进程名映射
+    QHash<quint32, QString> nameMap;
+    {
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe;
+            pe.dwSize = sizeof(pe);
+            if (Process32FirstW(hSnap, &pe)) {
+                do { nameMap.insert(pe.th32ProcessID, QString::fromWCharArray(pe.szExeFile)); }
+                while (Process32NextW(hSnap, &pe));
+            }
+            CloseHandle(hSnap);
+        }
+    }
+
+    for (quint32 i = 0; i < arr.count && i < 2048; ++i) {
+        const ArkOccupyEntry& e = arr.entries[i];
+        int r = table->rowCount();
+        table->insertRow(r);
+        table->setItem(r, 0, new QTableWidgetItem(QString::number(e.pid)));
+        table->setItem(r, 1, new QTableWidgetItem(nameMap.value(e.pid, QStringLiteral("?"))));
+        table->setItem(r, 2, new QTableWidgetItem(
+            QStringLiteral("0x%1").arg(e.handle, 0, 16, QChar('0'))));
+        table->setItem(r, 3, new QTableWidgetItem(accessToString(e.grantedAccess)));
+        table->setItem(r, 4, new QTableWidgetItem(
+            QStringLiteral("0x%1").arg(e.object, 0, 16, QChar('0'))));
+    }
+
+    // 映像引用条目（无句柄, 无法强关, 仅提示）
+    for (const auto& m : imageMatches) {
+        int r = table->rowCount();
+        table->insertRow(r);
+        table->setItem(r, 0, new QTableWidgetItem(QString::number(m.pid)));
+        table->setItem(r, 1, new QTableWidgetItem(m.name));
+        table->setItem(r, 2, new QTableWidgetItem(QStringLiteral("-")));
+        table->setItem(r, 3, new QTableWidgetItem(m.hint));
+        table->setItem(r, 4, new QTableWidgetItem(QStringLiteral("-")));
+        for (int c = 0; c < 5; ++c) {
+            table->item(r, c)->setForeground(QColor(0, 0, 160));
+        }
+    }
+
+    auto* btnRow = new QHBoxLayout();
+    auto* closeBtn = new QPushButton(QStringLiteral("强制解除占用 (关闭选中句柄)"), &dlg);
+    closeBtn->setEnabled(arr.count > 0);
+    auto* cancelBtn = new QPushButton(QStringLiteral("关闭"), &dlg);
+    btnRow->addWidget(closeBtn);
+    btnRow->addStretch();
+    btnRow->addWidget(cancelBtn);
+    layout->addLayout(btnRow);
+
+    connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
+    connect(closeBtn, &QPushButton::clicked, this, [&]() {
+        int row = table->currentRow();
+        if (row < 0 || row >= (int)arr.count) {
+            QMessageBox::information(&dlg, QStringLiteral("EFCHSword"),
+                QStringLiteral("请先选中一个占用项"));
+            return;
+        }
+        const ArkOccupyEntry& e = arr.entries[row];
+        if (QMessageBox::warning(&dlg, QStringLiteral("EFCHSword"),
+                QStringLiteral("确定关闭进程 %1 (PID=%2) 的句柄 0x%3 吗?\n"
+                               "强制关闭句柄可能导致目标进程异常!")
+                    .arg(nameMap.value(e.pid, QStringLiteral("?"))).arg(e.pid)
+                    .arg(e.handle, 0, 16, QChar('0')),
+                QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) return;
+        if (ctx.driver().closeProcessHandle(e.pid, e.handle)) {
+            table->removeRow(row);
+            QMessageBox::information(&dlg, QStringLiteral("EFCHSword"),
+                QStringLiteral("句柄已关闭"));
+        } else {
+            QMessageBox::warning(&dlg, QStringLiteral("EFCHSword"),
+                QStringLiteral("关闭句柄失败 (错误码: %1)").arg(ctx.driver().lastIoError()));
+        }
+    });
+
+    dlg.exec();
 }
 
 void FilePage::onReadFile()

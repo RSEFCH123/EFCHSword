@@ -1,4 +1,4 @@
-#include "DeleteDirProgressDialog.h"
+﻿#include "DeleteDirProgressDialog.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>

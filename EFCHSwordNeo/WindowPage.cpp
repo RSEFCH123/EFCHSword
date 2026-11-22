@@ -1,4 +1,4 @@
-#include "WindowPage.h"
+﻿#include "WindowPage.h"
 #include "AppContext.h"
 
 #include <QVBoxLayout>

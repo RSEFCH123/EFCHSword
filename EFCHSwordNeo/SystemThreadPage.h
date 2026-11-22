@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QWidget>
 #include <QVector>
@@ -11,8 +11,9 @@ class QMenu;
 class QLineEdit;
 
 // 系统线程管理标签页
-// 通过 IOCTL_ENUMTHREADBYPROCESS 枚举 PID=4 (System) 进程的所有线程
-// 每个线程通过 IOCTL_GETDRIVERPATCHBYETHREAD 标注所属驱动
+// 通过 IOCTL_CID_ENUMSYSTEMTHREADS (0x604) 枚举全部线程：
+//   内核 CID 表全量遍历 + PsIsSystemThread 判定 + 起始地址模块归属，
+//   一次 IOCTL 返回完整列表（含每个系统线程所属驱动文件名）。
 // 支持通过 IOCTL_APCTERMINATETHREADBYETHREAD 销毁线程
 class SystemThreadPage : public QWidget
 {
@@ -44,5 +45,5 @@ private:
     QMenu* m_contextMenu = nullptr;
 
     // 当前显示的线程列表（用于右键定位）
-    QVector<ThreadInfo> m_threads;
+    QVector<ArkSysThreadEntry> m_threads;
 };

@@ -1,4 +1,4 @@
-#include "AppContext.h"
+﻿#include "AppContext.h"
 #include <QApplication>
 #include <QDir>
 #include <QFile>
@@ -15,8 +15,20 @@
 #include <tlhelp32.h>
 
 // 枚举指定进程的所有线程 ID（用于 FakeMode 线程保护）
+// 优先使用驱动 IOCTL_ENUMTHREADBYPROCESS，驱动不可用时回退到 ToolHelp32
 static QVector<DWORD> EnumProcessThreads(DWORD pid)
 {
+    auto& ctx = AppContext::instance();
+    if (ctx.driverLoaded()) {
+        QVector<ThreadInfo> threads = ctx.driver().enumThreadsByProcess(pid);
+        if (!threads.isEmpty()) {
+            QVector<DWORD> result;
+            result.reserve(threads.size());
+            for (const auto& ti : threads) result.append(ti.tid);
+            return result;
+        }
+    }
+
     QVector<DWORD> tids;
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return tids;
@@ -120,52 +132,226 @@ void AppContext::detectWindowsVersion()
 
 bool AppContext::loadDriverFromResource()
 {
-    // 从 Qt 资源释放驱动 sys 文件，然后加载
-    // 资源路径: ":/drivers/EFCHKernelDriver.sys"
-    QString resPath = QStringLiteral(":/drivers/EFCHKernelDriver.sys");
-    if (!QFile::exists(resPath)) {
-        qWarning() << "Driver resource not found:" << resPath;
-        return false;
+    // 加载策略（陈旧驱动防御）:
+    // 1. 若设备已打开 (本进程已加载过) -> 直接复用
+    // 2. 读取资源内驱动并计算 SHA256, 与硬盘 C:\EFCHKernelDriver.sys 比对
+    // 3. 磁盘与资源【不一致】时: 若系统中有驻留驱动实例 (即使版本号相同,
+    //    也可能是"版本号没变但代码已更新"的旧构建) -> 先无条件卸载驻留实例,
+    //    释放对 sys 的占用, 然后覆盖部署新文件再加载。
+    //    这修复了旧问题: 版本号相同时直接复用内核里的旧驱动,
+    //    导致已修复的缺陷 (SSDT 1168 / 命名空间 0 对象等) 依旧复现。
+    // 4. 磁盘与资源一致时: 直接加载 (installDriver 内部还有版本校验,
+    //    版本不符会卸载旧驱动并重试)。
+    QString errMsg;
+    if (m_driver.isLoaded()) {
+        qInfo() << "Driver device handle already opened, reuse it";
+        return true;
     }
 
-    // 释放到 C:\ 根目录（与易语言版本一致，避免中文路径导致 NtLoadDriver 失败）
-    QString destPath = QStringLiteral("C:\\EFCHKernelDriver.sys");
+    const QString destPath = QStringLiteral("C:\\EFCHKernelDriver.sys");
+    const QString resPath = QStringLiteral(":/drivers/EFCHKernelDriver.sys");
 
+    // 读取资源中的驱动
     QFile resFile(resPath);
     if (!resFile.open(QIODevice::ReadOnly)) {
         qWarning() << "Cannot open driver resource";
+        m_lastError = QStringLiteral("无法打开驱动资源");
         return false;
     }
-    QFile destFile(destPath);
-    if (!destFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        qWarning() << "Cannot write driver to:" << destPath << "error:" << destFile.errorString();
-        return false;
-    }
-    destFile.write(resFile.readAll());
-    destFile.close();
+    QByteArray resData = resFile.readAll();
     resFile.close();
 
-    // 校验释放后的文件哈希，确认资源未被损坏
-    QFile hashCheck(destPath);
-    if (hashCheck.open(QIODevice::ReadOnly)) {
-        QCryptographicHash sha256(QCryptographicHash::Sha256);
-        sha256.addData(&hashCheck);
-        QByteArray hash = sha256.result().toHex();
-        hashCheck.close();
-        qInfo() << "Extracted driver SHA256:" << QString::fromLatin1(hash)
-                << "size:" << QFileInfo(destPath).size() << "bytes";
-    } else {
-        qWarning() << "Cannot re-open extracted file for hash check";
+    if (resData.isEmpty()) {
+        m_lastError = QStringLiteral("驱动资源为空");
+        return false;
     }
 
-    // 加载驱动
-    QString errMsg;
-    if (!m_driver.installDriver(destPath, &errMsg)) {
+    QByteArray resHash = QCryptographicHash::hash(resData, QCryptographicHash::Sha256);
+
+    // 比对硬盘上的 sys 文件
+    bool diskMatches = false;
+    if (QFile::exists(destPath)) {
+        QFile destFile(destPath);
+        if (destFile.open(QIODevice::ReadOnly)) {
+            QByteArray destData = destFile.readAll();
+            destFile.close();
+            if (!destData.isEmpty()) {
+                QByteArray destHash = QCryptographicHash::hash(destData, QCryptographicHash::Sha256);
+                diskMatches = (destHash == resHash);
+            }
+        }
+    }
+
+    // 驱动关键节点都写入日志（下次崩溃可用 EFCHSword_log.txt 定位阶段）
+    qInfo() << "Deploy check: resource SHA" << QString::fromLatin1(resHash.toHex()).left(16);
+
+    bool residentUnloadFailed = false;
+    if (diskMatches) {
+        qInfo() << "On-disk driver matches resource, SHA256:"
+                << QString::fromLatin1(resHash.toHex());
+    } else {
+        qInfo() << "On-disk driver differs from resource (or missing), will redeploy.\n"
+                << "  res  :" << QString::fromLatin1(resHash.toHex());
+
+        // 资源与磁盘不一致: 若有驻留驱动实例, 无条件卸载 (不比较版本号,
+        // 防止版本号相同的旧构建被复用), 释放 sys 占用后覆盖
+        if (m_driver.probeResidentDriver()) {
+            qInfo() << "Resident driver instance detected, unloading before redeploy";
+            if (m_driver.uninstallDriver()) {
+                qInfo() << "Resident driver unloaded";
+            } else {
+                // 卸载失败: 驱动仍占用 sys。常见原因是上次崩溃留下的
+                // 受保护/僵尸 EFCHSwordNeo 实例还握着设备句柄——
+                // 用驱动强杀所有残留实例后重试卸载（自愈，免重启）。
+                qWarning() << "Resident driver unload failed, killing stale instances";
+                residentUnloadFailed = !killStaleInstancesAndRetryUnload();
+            }
+        }
+    }
+
+    // 一致时的快速路径: 直接安装 (复用驻留实例或从磁盘加载)
+    if (diskMatches) {
+        if (m_driver.installDriver(destPath, &errMsg)) {
+            qInfo() << "Driver connected:" << errMsg;
+            return true;
+        }
+        // installDriver 可能在版本不符时卸载了旧驱动后返回 false (磁盘文件未变),
+        // 此时直接重试一次加载
+        if (m_driver.installDriver(destPath, &errMsg)) {
+            qInfo() << "Driver installed after stale unload:" << errMsg;
+            return true;
+        }
+        qWarning() << "Install driver failed:" << errMsg;
+        m_lastError = errMsg;
+        return false;
+    }
+
+    // 覆盖部署 (用 MoveFileEx 原子替换, 先写临时文件再替换, 避免半写状态)
+    QString loadPath = destPath;
+    {
+        const QString tempPath = destPath + QStringLiteral(".tmp");
+        QFile::remove(tempPath);
+        QFile tempFile(tempPath);
+        if (tempFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            tempFile.write(resData);
+            tempFile.close();
+
+            // 尝试原子替换 (失败则直接用原文件)
+            if (MoveFileExW(reinterpret_cast<LPCWSTR>(tempPath.utf16()),
+                            reinterpret_cast<LPCWSTR>(destPath.utf16()),
+                            MOVEFILE_REPLACE_EXISTING)) {
+                qInfo() << "Driver overwritten successfully";
+            } else {
+                DWORD err = GetLastError();
+                qWarning() << "MoveFileEx failed, error:" << err
+                           << "- will try direct write, or load existing on-disk file";
+                // 原子替换失败, 尝试直接写
+                QFile::remove(tempPath);
+                QFile directFile(destPath);
+                if (directFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                    directFile.write(resData);
+                    directFile.close();
+                    qInfo() << "Driver overwritten via direct write";
+                } else {
+                    // 覆盖不了: 若旧驱动还驻留(卸载失败), 绝不能静默加载
+                    // 硬盘上的旧版本——那会让用户以为新驱动已生效。
+                    // 明确报错让用户重启系统。
+                    if (residentUnloadFailed) {
+                        qWarning() << "Cannot overwrite driver and resident driver unload failed";
+                        m_lastError = QStringLiteral(
+                            "检测到旧版驻留驱动且无法卸载/覆盖（Sys 文件被占用）。"
+                            "当前所有功能仍在使用旧驱动，请关闭本程序后重启系统，再次运行即可加载新驱动。");
+                        return false;
+                    }
+                    qWarning() << "Cannot overwrite driver, loading existing on-disk file:"
+                               << directFile.errorString();
+                    if (!QFile::exists(destPath)) {
+                        m_lastError = QStringLiteral("无法写入驱动文件且硬盘上无可用驱动: ")
+                                    + directFile.errorString();
+                        return false;
+                    }
+                    // loadPath 保持为 destPath, 加载硬盘上现有版本
+                }
+            }
+        } else {
+            // 临时文件都写不了, 但硬盘上可能有旧版本
+            qWarning() << "Cannot create temp file for overwrite:" << tempFile.errorString();
+            if (!QFile::exists(destPath)) {
+                m_lastError = QStringLiteral("无法创建临时驱动文件: ") + tempFile.errorString();
+                return false;
+            }
+        }
+    }
+
+    // 打印最终加载文件的哈希 (调试用)
+    {
+        QFile loadFile(loadPath);
+        if (loadFile.open(QIODevice::ReadOnly)) {
+            QByteArray loadData = loadFile.readAll();
+            loadFile.close();
+            qInfo() << "Loading driver from:" << loadPath
+                    << "size:" << loadData.size() << "bytes"
+                    << "SHA256:" << QString::fromLatin1(
+                          QCryptographicHash::hash(loadData, QCryptographicHash::Sha256).toHex());
+        } else {
+            qInfo() << "Loading driver from:" << loadPath
+                    << "size:" << QFileInfo(loadPath).size() << "bytes";
+        }
+    }
+
+    if (!m_driver.installDriver(loadPath, &errMsg)) {
         qWarning() << "Install driver failed:" << errMsg;
         m_lastError = errMsg;
         return false;
     }
     return true;
+}
+
+// 强杀残留的 EFCHSwordNeo 实例后重试卸载驱动（自愈路径，免重启）。
+// 旧版本启动时对自己 protectProcess+PPL，崩溃后留下的僵尸进程普通手段
+// 杀不掉（驱动还在替它剥句柄），但驱动自己可以 ZwTerminateProcess 强杀。
+// 返回 true 表示卸载最终成功。
+bool AppContext::killStaleInstancesAndRetryUnload()
+{
+    const QString selfName = QStringLiteral("EFCHSwordNeo.exe");
+    const DWORD selfPid = GetCurrentProcessId();
+    QVector<DWORD> stalePids;
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe = {0};
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(hSnap, &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, (const wchar_t*)selfName.utf16()) == 0 &&
+                    pe.th32ProcessID != selfPid) {
+                    stalePids.append(pe.th32ProcessID);
+                }
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+    }
+
+    for (DWORD pid : stalePids) {
+        qInfo() << "Killing stale EFCHSwordNeo instance, PID:" << pid;
+        // 依次尝试: 驱动强杀（可杀受保护进程）-> 后备 TerminateProcess
+        if (!m_driver.zwKillProcess(pid)) {
+            HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+            if (h) {
+                TerminateProcess(h, 1);
+                CloseHandle(h);
+            }
+        }
+    }
+    if (!stalePids.isEmpty()) {
+        Sleep(800);   // 等句柄释放
+    }
+
+    if (m_driver.uninstallDriver()) {
+        qInfo() << "Resident driver unloaded after killing stale instances";
+        return true;
+    }
+    return false;
 }
 
 bool AppContext::initialize()
@@ -221,14 +407,17 @@ bool AppContext::initialize()
         m_driverLoaded = true;
         writeLog(QStringLiteral("Driver is ready"));
 
-        // 6. 启动时自我保护（protectProcess + PPL_Antimalware）
-        DWORD myPid = GetCurrentProcessId();
-        if (m_driver.protectProcess(myPid)) {
-            writeLog(QStringLiteral("Self-protect enabled (IOCTL_PROTECTPROCESS)"));
-        }
-        if (m_driver.setPPL(myPid, PPL_Antimalware)) {
-            writeLog(QStringLiteral("PPL set to Antimalware"));
-        }
+        // 注意：【不要】对自身进程做 protectProcess / setPPL 自保！
+        // 旧版本在这里把自己标记为 PPL_Antimalware，后果：
+        //   1) WER 无法读取/转储受保护进程（崩溃日志 "ReadProcessMemory
+        //      failed ... PebBaseAddress" 就是它），崩溃后无法分析；
+        //   2) PPL 之后进程内任何非微软签名 DLL 都无法加载，懒加载失败
+        //      重试导致 CPU/内存狂飙直至崩溃（间歇性复现）；
+        //   3) 崩溃时 cleanup 未执行，受保护的僵尸进程杀不掉，占住
+        //      C:\EFCHKernelDriver.sys 与设备句柄，之后每次启动都崩，
+        //      只能重启系统。
+        // 自保收益为零（ARK 工具无需防杀），已彻底移除。
+        // FakeMode（-fake 显式启用）的保护仍然保留。
 
         // 7. 如果是 FakeMode，应用保护措施
         applyFakeModeProtections();
@@ -259,9 +448,25 @@ void AppContext::cleanup()
 
 void AppContext::writeLog(const QString& msg)
 {
-    // 简单的控制台输出（FakeMode 下不输出）
+    // FakeMode 下不输出
     if (m_fakeMode) return;
     qDebug().noquote() << QStringLiteral("[EFCHSword]") << msg;
+
+    // 同时落文件（exe 同目录），崩溃后可据此还原启动流程定位问题
+    QString path = QCoreApplication::applicationDirPath()
+        + QStringLiteral("/EFCHSword_log.txt");
+    QFile f(path);
+    if (f.size() > 1024 * 1024) {
+        // 超过 1MB 轮转
+        QFile::remove(path + QStringLiteral(".old"));
+        QFile::rename(path, path + QStringLiteral(".old"));
+    }
+    if (f.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+        f.write(QString(QStringLiteral("[%1] %2\r\n"))
+            .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")))
+            .arg(msg).toUtf8());
+        f.close();
+    }
 }
 
 // ===== FakeMode 辅助函数 =====

@@ -1,4 +1,4 @@
-#include "DiskHexDialog.h"
+﻿#include "DiskHexDialog.h"
 #include "AppContext.h"
 
 #include <QVBoxLayout>

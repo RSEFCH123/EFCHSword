@@ -1,4 +1,4 @@
-#include "KernelDriver.h"
+﻿#include "KernelDriver.h"
 #include <QDebug>
 #include <QFileInfo>
 #include <QDir>
@@ -70,6 +70,7 @@ typedef LONG(NTAPI* NtUnloadDriver_t)(PUNICODE_STRING DriverServiceName);
 #define IOCTL_NTFS_READFILE            0x922   // 输入4096B路径, 输出文件内容
 #define IOCTL_NTFS_ENUMDIR             0x925   // 输入路径, 输出 NTFS_DATA_INFO[]
 #define IOCTL_NTFS_GETQTY              0x926   // 输入路径, 输出 NTFS_FILE_FOLDER_QUANTITY
+#define IOCTL_NTFS_DELETEFILE          0x927   // 输入路径(UTF-16), 删除文件或目录(直接解析NTFS)
 
 // Thread
 #define IOCTL_SUSPENDTHREAD            0xA01
@@ -116,6 +117,72 @@ typedef LONG(NTAPI* NtUnloadDriver_t)(PUNICODE_STRING DriverServiceName);
 #define IOCTL_HOOK_DISABLEBSOD         0xD04
 #define IOCTL_HOOK_QUERYSTATUS         0xD05
 #define IOCTL_HOOK_DISABLENTDEVICEIOCONTROLFILE 0xD06
+
+// ===== ARK 扩展（与驱动 h/Kernel/ArkNeo.h 保持一致）=====
+// PspCidTable
+#define IOCTL_CID_ENUMPROCESSES        0x600
+#define IOCTL_CID_ENUMTHREADS          0x601
+#define IOCTL_CID_TERMINATETHREAD      0x602
+#define IOCTL_CID_TERMINATEPROCESS     0x603
+#define IOCTL_CID_ENUMSYSTEMTHREADS    0x604
+#define IOCTL_ENUMSYSCALLBACKS         0x605
+#define IOCTL_ENUMUNLOADEDDRIVERS      0x606
+// 键盘监视
+#define IOCTL_KBD_START                0x610
+#define IOCTL_KBD_STOP                 0x611
+#define IOCTL_KBD_READLOG             0x612
+#define IOCTL_KBD_CLEARLOG            0x613
+#define IOCTL_KBD_GETSTATUS           0x614
+#define IOCTL_KBD_ENUMHOTKEYS         0x615
+#define IOCTL_KBD_MODHOTKEY           0x616
+#define IOCTL_KBD_DELHOTKEY           0x617
+// 进程行为监视
+#define IOCTL_BEHAVIOR_READ           0x620
+#define IOCTL_BEHAVIOR_CLEAR          0x621
+#define IOCTL_BEHAVIOR_SETFILTER      0x622
+#define IOCTL_FILEMON_START           0x623
+#define IOCTL_FILEMON_STOP            0x624
+#define IOCTL_HARDEN_ADD              0x625
+#define IOCTL_HARDEN_REMOVE           0x626
+#define IOCTL_FILEMON_STATUS          0x627
+// 命名空间
+#define IOCTL_NS_ENUMDIR               0x700
+#define IOCTL_NS_DELETEOBJECT         0x701
+#define IOCTL_NS_QUERYPATH            0x702
+
+// ---- 注册表全内核操作 (ArkReg.cpp) ----
+#define IOCTL_REG_ENUMSUBKEYS         0x710
+#define IOCTL_REG_ENUMVALUES          0x711
+#define IOCTL_REG_CREATEKEY           0x712
+#define IOCTL_REG_DELETEKEY           0x713
+#define IOCTL_REG_DELETEVALUE         0x714
+#define IOCTL_REG_SETVALUE            0x715
+#define IOCTL_REG_RENAMEKEY           0x716
+#define IOCTL_REG_RENAMEVALUE         0x717
+// 进程扩展
+#define IOCTL_ENUMPROCESSHANDLES       0x813
+#define IOCTL_CLOSEHANDLE              0x814
+#define IOCTL_ARK_READMEMORY           0x815
+#define IOCTL_ARK_WRITEMEMORY          0x816
+#define IOCTL_ARK_QUERYVM              0x817
+#define IOCTL_ARK_GETPRIORITY          0x818
+#define IOCTL_ARK_SETPRIORITY          0x819
+#define IOCTL_ARK_GETAFFINITY          0x81A
+#define IOCTL_ARK_SETAFFINITY          0x81B
+#define IOCTL_ARK_GETPRIVILEGES        0x81C
+#define IOCTL_ARK_SETPRIVILEGE         0x81D
+#define IOCTL_ARK_GETTOKENINFO         0x81E
+// 文件占用扫描
+#define IOCTL_SCANFILEOCCUPY           0x928
+// 内核视图
+#define IOCTL_ARK_ENUMDRIVEROBJS       0xB14
+#define IOCTL_ARK_GETDRIVERDETAIL      0xB15
+#define IOCTL_ARK_ENUMMODULES          0xB16
+#define IOCTL_ARK_ENUMDEVICES          0xB17
+#define IOCTL_ARK_GETDEVICEDETAIL      0xB18
+#define IOCTL_ARK_QUERYSSDT            0xB19
+#define IOCTL_ARK_QUERYIDT             0xB1A
+#define IOCTL_ARK_ENUMOBJTYPES         0xB1B
 
 // 设备命名空间
 #define DEVICE_NAME     L"\\Device\\EFCHKernelDriver"
@@ -249,12 +316,16 @@ HANDLE KernelDriver::loadDrive(const QString& path, const QString& serviceName)
     uniName.MaximumLength = uniName.Length + sizeof(WCHAR);
 
     // 0. 先尝试卸载残留的驱动（上次崩溃/被杀遗留的服务项）
+    //    卸载失败时保留注册表项，否则驻留的驱动会丢失服务项变成僵尸
     if (pNtUnloadDriver) {
         LONG preStatus = pNtUnloadDriver(&uniName);
         qInfo() << "Pre-cleanup NtUnloadDriver status: 0x" << Qt::hex << preStatus;
+        if (preStatus == STATUS_SUCCESS_NT || preStatus == 0xC0000034L) {
+            deleteDriverRegistryEntry(serviceName);
+        }
+    } else {
+        deleteDriverRegistryEntry(serviceName);
     }
-    // 清理残留注册表项
-    deleteDriverRegistryEntry(serviceName);
 
     // 1. 写入注册表服务项
     if (!writeDriverRegistryEntry(serviceName, path)) {
@@ -371,11 +442,20 @@ bool KernelDriver::uninstallDrive(const QString& serviceName, bool stopFirst)
 
     LONG status = pNtUnloadDriver(&uniName);
 
-    // 删除注册表项
-    deleteDriverRegistryEntry(serviceName);
-
     // STATUS_SUCCESS 或 STATUS_OBJECT_NAME_NOT_FOUND 都算成功
-    return status == STATUS_SUCCESS_NT || status == 0xC0000034L;
+    if (status == STATUS_SUCCESS_NT || status == 0xC0000034L) {
+        // 只有确认驱动已卸载（或本来就不存在）才删除注册表项
+        deleteDriverRegistryEntry(serviceName);
+        return true;
+    }
+
+    // 卸载失败：必须保留注册表项！
+    // 此时驱动仍驻留内存（引用计数未归零），若删掉服务项，之后
+    // NtUnloadDriver 将再也找不到服务，驱动变成无法卸载的僵尸，
+    // 新驱动也无法加载（设备名冲突），只能重启系统。
+    qWarning() << "NtUnloadDriver failed, NTSTATUS: 0x" << Qt::hex << status
+               << "- registry entry kept so the driver can still be unloaded later";
+    return false;
 }
 
 bool KernelDriver::installDriver(const QString& sysFilePath, QString* errMsg)
@@ -389,10 +469,39 @@ bool KernelDriver::installDriver(const QString& sysFilePath, QString* errMsg)
     //    这一步在文件存在检查之前，避免在驱动已加载但 sys 不可写时误报失败
     m_hDevice = getDriveHandle(m_driverName);
     if (m_hDevice != INVALID_HANDLE_VALUE && m_hDevice != nullptr) {
-        qInfo() << "Driver already loaded, opened existing device handle";
-        m_driverPath = sysFilePath;
-        if (errMsg) *errMsg = QStringLiteral("驱动已加载（复用现有实例）");
-        return true;
+        // 版本校验：上次崩溃残留的旧版驱动可能带有已修复的严重缺陷
+        // （如特征码扫描死循环导致的 CPU/内存狂飙），绝不能直接复用。
+        // 版本不符 -> 卸载旧驱动并返回失败，让上层走全新安装流程覆盖 sys 后重载。
+        quint32 ver = getDriverVersion();
+        if (ver == kExpectedDriverVersion) {
+            qInfo() << "Driver already loaded (version" << ver << "), reuse device handle";
+            m_driverPath = sysFilePath;
+            if (errMsg) *errMsg = QStringLiteral("驱动已加载（复用现有实例）");
+            return true;
+        }
+        qWarning() << "Stale driver detected: loaded version" << ver
+                   << "!= expected" << kExpectedDriverVersion
+                   << "- unloading for reinstall";
+        CloseHandle(m_hDevice);
+        m_hDevice = INVALID_HANDLE_VALUE;
+
+        if (uninstallDrive(m_driverName, true)) {
+            // 旧驱动已卸载，sys 文件不再被占用，上层可覆盖新文件后重新加载
+            if (errMsg) *errMsg = QStringLiteral("检测到旧版残留驱动已卸载，正在重新安装");
+            return false;
+        }
+        // 卸载失败：设备对象仍存在，新驱动无法加载（设备名冲突）。
+        // 降级复用旧驱动保证程序可用；注册表项已保留，下次仍可重试卸载。
+        HANDLE hFallback = getDriveHandle(m_driverName);
+        if (hFallback != INVALID_HANDLE_VALUE && hFallback != nullptr) {
+            m_hDevice = hFallback;
+            m_driverPath = sysFilePath;
+            qWarning() << "Stale driver unload failed, falling back to existing instance";
+            if (errMsg) *errMsg = QStringLiteral("旧版驱动卸载失败，已复用现有实例（建议重启系统后重新运行）");
+            return true;
+        }
+        if (errMsg) *errMsg = QStringLiteral("旧版驱动卸载失败且设备不可用，请重启系统后重试");
+        return false;
     }
     m_hDevice = INVALID_HANDLE_VALUE;
 
@@ -428,11 +537,31 @@ bool KernelDriver::uninstallDriver()
         m_hDevice = INVALID_HANDLE_VALUE;
     }
     bool ok = uninstallDrive(m_driverName, true);
-    // 删除 sys 文件
-    if (!m_driverPath.isEmpty()) {
+    // 仅在卸载成功后删除 sys 文件；失败时驱动仍占用该文件
+    // （删除也不会生效），保留以便下次重试卸载后覆盖新版本
+    if (ok && !m_driverPath.isEmpty()) {
         QFile::remove(m_driverPath);
     }
     return ok;
+}
+
+// 查询已加载驱动的版本号（驱动 IOCTL_DRV_GET_INFO, 功能码 0xD06）
+// 输入 LONG=1，输出 ULONG 版本。失败（含旧驱动不支持该命令）返回 0
+quint32 KernelDriver::getDriverVersion()
+{
+    if (m_hDevice == INVALID_HANDLE_VALUE || m_hDevice == nullptr) {
+        return 0;
+    }
+    LONG request = 1;
+    quint32 version = 0;
+    DWORD br = 0;
+    if (!deviceIoControl(0xD06, &request, sizeof(request), &version, sizeof(version), &br)) {
+        return 0;
+    }
+    if (br < sizeof(version)) {
+        return 0;
+    }
+    return version;
 }
 
 bool KernelDriver::deviceIoControl(quint32 function, LPVOID inBuffer, DWORD inSize,
@@ -450,6 +579,150 @@ bool KernelDriver::deviceIoControl(quint32 function, LPVOID inBuffer, DWORD inSi
                               bytesReturned, nullptr);
     m_lastError = ok ? ERROR_SUCCESS : GetLastError();
     return ok != FALSE;
+}
+
+// ===== Hypervisor (Intel VT-x, 0xB06-0xB08) =====
+
+bool KernelDriver::hvQuery(HvQueryInfo& out)
+{
+    ZeroMemory(&out, sizeof(out));
+    DWORD br = 0;
+    if (!deviceIoControl(0xB06, nullptr, 0, &out, sizeof(out), &br)) return false;
+    return br >= sizeof(out);
+}
+
+bool KernelDriver::hvStart(quint32 options)
+{
+    return deviceIoControl(0xB07, &options, sizeof(options), nullptr, 0);
+}
+
+bool KernelDriver::hvStop()
+{
+    return deviceIoControl(0xB08, nullptr, 0, nullptr, 0);
+}
+
+bool KernelDriver::hvReadMem(quint32 pid, quint64 address, QByteArray& outData)
+{
+    // 大小在调用前由 UI 限定 <= 0x8000；这里通过 outData 长度传递期望大小
+    const int size = outData.size();
+    if (size <= 0 || size > 0x8000) return false;
+    QByteArray buf;
+    buf.resize(sizeof(HvMemAccess) + size);
+    auto* acc = reinterpret_cast<HvMemAccess*>(buf.data());
+    acc->pid = pid;
+    acc->size = (quint32)size;
+    acc->address = address;
+    DWORD br = 0;
+    if (!deviceIoControl(0x628, buf.data(), (DWORD)buf.size(), buf.data(), (DWORD)buf.size(), &br)) return false;
+    if (br < sizeof(HvMemAccess) + size) return false;
+    outData = QByteArray(buf.constData() + sizeof(HvMemAccess), size);
+    return true;
+}
+
+bool KernelDriver::hvWriteMem(quint32 pid, quint64 address, const QByteArray& data)
+{
+    const int size = data.size();
+    if (size <= 0 || size > 0x8000) return false;
+    QByteArray buf;
+    buf.resize(sizeof(HvMemAccess) + size);
+    auto* acc = reinterpret_cast<HvMemAccess*>(buf.data());
+    acc->pid = pid;
+    acc->size = (quint32)size;
+    acc->address = address;
+    memcpy(buf.data() + sizeof(HvMemAccess), data.constData(), size);
+    return deviceIoControl(0x629, buf.data(), (DWORD)buf.size(), buf.data(), (DWORD)buf.size());
+}
+
+// ===== Hypervisor R-1 进程处置 (0x62A) =====
+// 线格式与驱动 h/Kernel/ArkHv.h 的 HV_PROCESS_CONTROL / HV_PROCESS_RESULT 一致。
+
+bool KernelDriver::hvmProcessControl(quint32 operation, quint32 pid, quint64 linearAddress,
+                                     HvProcessResult& out)
+{
+#pragma pack(push, 8)
+    struct WireRow {
+        quint32 pid;
+        quint32 disposition;
+        quint64 directoryBase;
+        quint64 guestPhysicalAddress;
+        quint64 guestLinearAddress;
+        quint64 interceptCount;
+        quint32 hierarchyIndex;
+        quint32 reserved;
+    };
+    struct WireIn {
+        quint32 pid;
+        quint32 operation;
+        quint64 linearAddress;
+    };
+    struct WireOut {
+        quint32 status;
+        quint32 rowCount;
+        quint32 returnedRows;
+        quint32 residentActive;
+        qint32 lastStatus;
+        quint64 stateFlags;
+        WireRow rows[8];
+    };
+#pragma pack(pop)
+    static_assert(sizeof(WireRow) == 48, "wire row layout mismatch");
+    static_assert(sizeof(WireOut) == 416, "wire result layout mismatch");
+
+    out = HvProcessResult{};
+    WireIn in{ pid, operation, linearAddress };
+    WireOut io{};
+    DWORD br = 0;
+    if (!deviceIoControl(0x62A, &in, sizeof(in), &io, sizeof(io), &br)) return false;
+    if (br < sizeof(io)) return false;
+
+    out.status = io.status;
+    out.rowCount = io.rowCount;
+    out.returnedRows = io.returnedRows;
+    out.residentActive = io.residentActive;
+    out.lastStatus = io.lastStatus;
+    out.stateFlags = io.stateFlags;
+    const quint32 n = qMin<quint32>(io.returnedRows, 8);
+    for (quint32 i = 0; i < n; ++i) {
+        HvProcessRow row;
+        row.pid = io.rows[i].pid;
+        row.disposition = io.rows[i].disposition;
+        row.directoryBase = io.rows[i].directoryBase;
+        row.guestPhysicalAddress = io.rows[i].guestPhysicalAddress;
+        row.guestLinearAddress = io.rows[i].guestLinearAddress;
+        row.interceptCount = io.rows[i].interceptCount;
+        row.hierarchyIndex = io.rows[i].hierarchyIndex;
+        out.rows.push_back(row);
+    }
+    return true;
+}
+
+bool KernelDriver::hvmFreezeProcess(quint32 pid, quint64 linearAddress, HvProcessResult* out)
+{
+    HvProcessResult r;
+    if (!hvmProcessControl(HvProcOpFreeze, pid, linearAddress, r)) return false;
+    if (out) *out = r;
+    return r.status == 0;
+}
+
+bool KernelDriver::hvmTerminateProcess(quint32 pid, quint64 linearAddress, HvProcessResult* out)
+{
+    HvProcessResult r;
+    if (!hvmProcessControl(HvProcOpTerminate, pid, linearAddress, r)) return false;
+    if (out) *out = r;
+    return r.status == 0;
+}
+
+bool KernelDriver::hvmResumeProcess(quint32 pid, HvProcessResult* out)
+{
+    HvProcessResult r;
+    if (!hvmProcessControl(HvProcOpRelease, pid, 0, r)) return false;
+    if (out) *out = r;
+    return r.status == 0;
+}
+
+bool KernelDriver::hvParityNow()
+{
+    return deviceIoControl(0x62B, nullptr, 0, nullptr, 0);
 }
 
 // ===== 进程操作 =====
@@ -969,6 +1242,17 @@ bool KernelDriver::ntfsCountDirectory(const QString& dirPath, NtfsFileFolderQuan
     return br >= sizeof(outQty);
 }
 
+bool KernelDriver::ntfsDeleteFile(const QString& filePath)
+{
+    // 驱动协议 (IOCTL_NTFS_DELETEFILE, function=0x927):
+    //   输入: UTF-16 路径 (最多 4096 字节, null 结尾)
+    //   输出: 无 (info=0)
+    //   要求: 已通过 IOCTL_NTFS_INIT 初始化对应卷
+    //   驱动调用 NtfsSecureDeleteFilePath, 文件和目录均可删除
+    QByteArray pathBuf = toNtfsPathBuffer(filePath);
+    return deviceIoControl(IOCTL_NTFS_DELETEFILE, pathBuf.data(), pathBuf.size(), nullptr, 0);
+}
+
 // ===== 磁盘操作 =====
 
 bool KernelDriver::writeDisk(quint64 startSector, quint64 sectorNumber, const QByteArray& data)
@@ -1353,4 +1637,573 @@ bool KernelDriver::hookQueryStatus(qint32 operation)
 bool KernelDriver::hookDisableNtDeviceIoControlFile()
 {
     return deviceIoControl(IOCTL_HOOK_DISABLENTDEVICEIOCONTROLFILE, nullptr, 0, nullptr, 0);
+}
+
+// ==================== ARK 扩展 ====================
+// 注意：METHOD_BUFFERED 下输入输出共用 SystemBuffer。
+// 所有"输入结构+输出结构"的 IOCTL 都必须先在输出尺寸的缓冲里放好输入，
+// 驱动读完输入参数后才会覆写缓冲为输出。
+
+// ---- 辅助：宽字符串拷入 wchar 缓冲（保证 null 结尾） ----
+static void copyWStrToBuffer(wchar_t* dst, size_t dstChars, const QString& src)
+{
+    size_t n = qMin<size_t>((size_t)src.size(), dstChars - 1);
+    for (size_t i = 0; i < n; ++i) {
+        dst[i] = src[(int)i].unicode();
+    }
+    dst[n] = L'\0';
+}
+
+static QString wStrToQString(const wchar_t* s, size_t maxChars)
+{
+    size_t n = 0;
+    while (n < maxChars && s[n] != L'\0') ++n;
+    return QString::fromWCharArray(s, (int)n);
+}
+
+// ===== ARK: PspCidTable =====
+
+bool KernelDriver::cidEnumProcesses(ArkCidProcessArray& out)
+{
+    return deviceIoControl(IOCTL_CID_ENUMPROCESSES, nullptr, 0, &out, sizeof(out));
+}
+
+bool KernelDriver::cidEnumThreads(ArkCidThreadArray& out, quint32 ownerPid)
+{
+    if (!deviceIoControl(IOCTL_CID_ENUMTHREADS, nullptr, 0, &out, sizeof(out)))
+        return false;
+    // 驱动返回全部线程，按 ownerPid 过滤
+    if (ownerPid != 0) {
+        quint32 w = 0;
+        for (quint32 i = 0; i < out.count; ++i) {
+            if (out.entries[i].ownerPid == ownerPid) {
+                out.entries[w++] = out.entries[i];
+            }
+        }
+        out.count = w;
+    }
+    return true;
+}
+
+bool KernelDriver::cidTerminateThread(quint32 tid)
+{
+    return deviceIoControl(IOCTL_CID_TERMINATETHREAD, &tid, sizeof(tid), nullptr, 0);
+}
+
+bool KernelDriver::cidTerminateProcess(quint32 pid)
+{
+    return deviceIoControl(IOCTL_CID_TERMINATEPROCESS, &pid, sizeof(pid), nullptr, 0);
+}
+
+bool KernelDriver::cidEnumSystemThreads(ArkSysThreadArray& out)
+{
+    // 驱动协议 (IOCTL_CID_ENUMSYSTEMTHREADS, function=0x604):
+    //   输入:  无
+    //   输出:  ARK_SYS_THREAD_ARRAY（CID 全量枚举 + PsIsSystemThread 过滤，
+    //          StartAddress 已在内核完成模块归属，无需逐线程二次查询）
+    return deviceIoControl(IOCTL_CID_ENUMSYSTEMTHREADS, nullptr, 0,
+                           &out, sizeof(out));
+}
+
+bool KernelDriver::arkEnumSysCallbacks(ArkCallbackArray& out)
+{
+    return deviceIoControl(IOCTL_ENUMSYSCALLBACKS, nullptr, 0,
+                           &out, sizeof(out));
+}
+
+bool KernelDriver::arkEnumUnloadedDrivers(ArkUnloadedArray& out)
+{
+    return deviceIoControl(IOCTL_ENUMUNLOADEDDRIVERS, nullptr, 0,
+                           &out, sizeof(out));
+}
+
+// ===== ARK: 键盘监视 =====
+
+bool KernelDriver::kbdStart()
+{
+    // 某些旧版 WDM 分发器对 METHOD_BUFFERED 的完全空缓冲返回 87；
+    // 命令本身无数据，传一个明确的占位字节兼容这类分发器。
+    quint32 command = 0;
+    return deviceIoControl(IOCTL_KBD_START, &command, sizeof(command), nullptr, 0);
+}
+
+bool KernelDriver::kbdStop()
+{
+    quint32 command = 0;
+    return deviceIoControl(IOCTL_KBD_STOP, &command, sizeof(command), nullptr, 0);
+}
+
+bool KernelDriver::kbdReadLog(quint64 lastSeq, ArkKbdLog& out)
+{
+    // 输入: ULONGLONG lastSeq；输出: ARK_KBD_LOG（共用缓冲）
+    QByteArray buf(sizeof(ArkKbdLog), Qt::Uninitialized);
+    memcpy(buf.data(), &lastSeq, sizeof(lastSeq));
+    if (!deviceIoControl(IOCTL_KBD_READLOG, buf.data(), sizeof(quint64),
+                         buf.data(), sizeof(ArkKbdLog))) {
+        return false;
+    }
+    memcpy(&out, buf.constData(), sizeof(ArkKbdLog));
+    return true;
+}
+
+bool KernelDriver::kbdClearLog()
+{
+    return deviceIoControl(IOCTL_KBD_CLEARLOG, nullptr, 0, nullptr, 0);
+}
+
+bool KernelDriver::kbdGetStatus(ArkKbdStatus& out)
+{
+    return deviceIoControl(IOCTL_KBD_GETSTATUS, nullptr, 0, &out, sizeof(out));
+}
+
+bool KernelDriver::kbdEnumHotkeys(ArkHotkeyArray& out)
+{
+    // 无输入；输出 ARK_HOTKEY_ARRAY
+    return deviceIoControl(IOCTL_KBD_ENUMHOTKEYS, nullptr, 0, &out, sizeof(out));
+}
+
+bool KernelDriver::kbdModifyHotkey(quint32 pid, quint32 id, quint32 fsModifiers, quint32 vk,
+                                   quint32 newFsModifiers, quint32 newVk)
+{
+    ArkHotkeyModInput input;
+    memset(&input, 0, sizeof(input));
+    input.pid = pid;
+    input.id = id;
+    input.fsModifiers = fsModifiers;
+    input.vk = vk;
+    input.newFsModifiers = newFsModifiers;
+    input.newVk = newVk;
+    return deviceIoControl(IOCTL_KBD_MODHOTKEY, &input, sizeof(input), nullptr, 0);
+}
+
+bool KernelDriver::kbdDeleteHotkey(quint32 pid, quint32 id, quint32 fsModifiers, quint32 vk)
+{
+    ArkHotkeyModInput input;
+    memset(&input, 0, sizeof(input));
+    input.pid = pid;
+    input.id = id;
+    input.fsModifiers = fsModifiers;
+    input.vk = vk;
+    return deviceIoControl(IOCTL_KBD_DELHOTKEY, &input, sizeof(input), nullptr, 0);
+}
+
+// ===== ARK: 进程行为监视 =====
+
+bool KernelDriver::behaviorReadLog(quint64 lastSeq, ArkBehaviorLog& out)
+{
+    // 输入: ULONGLONG lastSeq；输出: ARK_BEHAVIOR_LOG（共用缓冲）
+    QByteArray buf(sizeof(ArkBehaviorLog), Qt::Uninitialized);
+    memcpy(buf.data(), &lastSeq, sizeof(lastSeq));
+    if (!deviceIoControl(IOCTL_BEHAVIOR_READ, buf.data(), sizeof(quint64),
+                         buf.data(), sizeof(ArkBehaviorLog))) {
+        return false;
+    }
+    memcpy(&out, buf.constData(), sizeof(ArkBehaviorLog));
+    return true;
+}
+
+bool KernelDriver::behaviorClearLog()
+{
+    return deviceIoControl(IOCTL_BEHAVIOR_CLEAR, nullptr, 0, nullptr, 0);
+}
+
+bool KernelDriver::behaviorSetFilter(quint32 mask)
+{
+    quint32 data[2] = { mask, 0 };
+    return deviceIoControl(IOCTL_BEHAVIOR_SETFILTER, data, sizeof(data), nullptr, 0);
+}
+
+bool KernelDriver::filemonStart()
+{
+    quint32 command = 0;
+    return deviceIoControl(IOCTL_FILEMON_START, &command, sizeof(command), nullptr, 0);
+}
+
+bool KernelDriver::filemonStop()
+{
+    quint32 command = 0;
+    return deviceIoControl(IOCTL_FILEMON_STOP, &command, sizeof(command), nullptr, 0);
+}
+
+bool KernelDriver::hardenAddPid(quint32 pid, quint64 ntdllBase, quint32* flags)
+{
+    if (flags) *flags = 0;
+    ArkHardenPid data;
+    data.pid = pid;
+    data.flags = 0;
+    data.ntdllBase = ntdllBase;
+    // 输入输出共用 16 字节缓冲, 驱动把结果位图写回 data.flags
+    if (!deviceIoControl(IOCTL_HARDEN_ADD, &data, sizeof(data), &data, sizeof(data), nullptr)) {
+        return false;
+    }
+    if (flags) *flags = data.flags;
+    return true;
+}
+
+bool KernelDriver::hardenRemovePid(quint32 pid)
+{
+    quint32 data[2] = { pid, 0 };
+    return deviceIoControl(IOCTL_HARDEN_REMOVE, data, sizeof(data), nullptr, 0);
+}
+
+bool KernelDriver::probeResidentDriver()
+{
+    // 只探测不持有：打开后立即关闭
+    HANDLE h = getDriveHandle(m_driverName);
+    if (h == INVALID_HANDLE_VALUE || h == nullptr) {
+        return false;
+    }
+    CloseHandle(h);
+    return true;
+}
+
+// ===== ARK: 命名空间 =====
+
+bool KernelDriver::nsEnumDir(const QString& path, ArkNsArray& out)
+{
+    // 输入: WCHAR 路径；输出: ARK_NS_ARRAY（共用缓冲）
+    std::wstring ws = path.toStdWString();
+    if (ws.size() > 500) ws.resize(500);
+    QByteArray buf(sizeof(ArkNsArray), Qt::Uninitialized);
+    memcpy(buf.data(), ws.c_str(), (ws.size() + 1) * sizeof(wchar_t));
+    if (!deviceIoControl(IOCTL_NS_ENUMDIR, buf.data(),
+                         (DWORD)((ws.size() + 1) * sizeof(wchar_t)),
+                         buf.data(), sizeof(ArkNsArray))) {
+        return false;
+    }
+    memcpy(&out, buf.constData(), sizeof(ArkNsArray));
+    return true;
+}
+
+bool KernelDriver::nsDeleteObject(const QString& typeName, const QString& fullPath)
+{
+    ArkNsDeleteInput input;
+    memset(&input, 0, sizeof(input));
+    copyWStrToBuffer(input.typeName, 24, typeName);
+    copyWStrToBuffer(input.path, 520, fullPath);
+    return deviceIoControl(IOCTL_NS_DELETEOBJECT, &input, sizeof(input), nullptr, 0);
+}
+
+bool KernelDriver::nsQueryPath(const QString& path, ArkNsObjectInfo& out)
+{
+    std::wstring ws = path.toStdWString();
+    if (ws.size() > 500) ws.resize(500);
+    QByteArray buf(sizeof(ArkNsObjectInfo), Qt::Uninitialized);
+    memcpy(buf.data(), ws.c_str(), (ws.size() + 1) * sizeof(wchar_t));
+    if (!deviceIoControl(IOCTL_NS_QUERYPATH, buf.data(),
+                         (DWORD)((ws.size() + 1) * sizeof(wchar_t)),
+                         buf.data(), sizeof(ArkNsObjectInfo))) {
+        return false;
+    }
+    memcpy(&out, buf.constData(), sizeof(ArkNsObjectInfo));
+    return true;
+}
+
+// ===== ARK: 注册表全内核操作 =====
+// 输入为 UI 格式路径（HKEY_LOCAL_MACHINE\SOFTWARE\...），内核翻译为
+// \Registry\Machine\... 并在 System 令牌上下文执行，可越过普通 ACL 限制。
+
+bool KernelDriver::regEnumSubKeys(const QString& uiPath, ArkRegEnumKeys& out)
+{
+    std::wstring ws = uiPath.toStdWString();
+    if (ws.size() > 380) ws.resize(380);
+    QByteArray buf(sizeof(ArkRegEnumKeys), Qt::Uninitialized);
+    memset(buf.data(), 0, sizeof(ArkRegEnumKeys));
+    memcpy(buf.data(), ws.c_str(), (ws.size() + 1) * sizeof(wchar_t));
+    if (!deviceIoControl(IOCTL_REG_ENUMSUBKEYS, buf.data(),
+                         (DWORD)((ws.size() + 1) * sizeof(wchar_t)),
+                         buf.data(), sizeof(ArkRegEnumKeys))) {
+        return false;
+    }
+    memcpy(&out, buf.constData(), sizeof(ArkRegEnumKeys));
+    // 防御: 驱动返回异常计数时截断, 避免读越界
+    if (out.count > 2048) out.count = 2048;
+    return true;
+}
+
+bool KernelDriver::regEnumValues(const QString& uiPath, ArkRegEnumValues& out)
+{
+    std::wstring ws = uiPath.toStdWString();
+    if (ws.size() > 380) ws.resize(380);
+    QByteArray buf(sizeof(ArkRegEnumValues), Qt::Uninitialized);
+    memset(buf.data(), 0, sizeof(ArkRegEnumValues));
+    memcpy(buf.data(), ws.c_str(), (ws.size() + 1) * sizeof(wchar_t));
+    if (!deviceIoControl(IOCTL_REG_ENUMVALUES, buf.data(),
+                         (DWORD)((ws.size() + 1) * sizeof(wchar_t)),
+                         buf.data(), sizeof(ArkRegEnumValues))) {
+        return false;
+    }
+    memcpy(&out, buf.constData(), sizeof(ArkRegEnumValues));
+    // 防御: 驱动返回异常计数/长度时截断, 避免读越界
+    if (out.count > 512) out.count = 512;
+    for (quint32 i = 0; i < out.count; ++i) {
+        if (out.values[i].dataLength > 1024) out.values[i].dataLength = 1024;
+    }
+    return true;
+}
+
+bool KernelDriver::regCreateKey(const QString& uiPath)
+{
+    std::wstring ws = uiPath.toStdWString();
+    if (ws.size() > 380) ws.resize(380);
+    QByteArray buf((qsizetype)(ws.size() + 1) * (qsizetype)sizeof(wchar_t), Qt::Uninitialized);
+    memcpy(buf.data(), ws.c_str(), buf.size());
+    return deviceIoControl(IOCTL_REG_CREATEKEY, buf.data(), (DWORD)buf.size(), nullptr, 0);
+}
+
+bool KernelDriver::regDeleteKey(const QString& uiPath)
+{
+    std::wstring ws = uiPath.toStdWString();
+    if (ws.size() > 380) ws.resize(380);
+    QByteArray buf((qsizetype)(ws.size() + 1) * (qsizetype)sizeof(wchar_t), Qt::Uninitialized);
+    memcpy(buf.data(), ws.c_str(), buf.size());
+    return deviceIoControl(IOCTL_REG_DELETEKEY, buf.data(), (DWORD)buf.size(), nullptr, 0);
+}
+
+bool KernelDriver::regDeleteValue(const QString& uiPath, const QString& valueName)
+{
+    ArkRegValueNameInput input;
+    memset(&input, 0, sizeof(input));
+    copyWStrToBuffer(input.keyPath, 384, uiPath);
+    copyWStrToBuffer(input.valueName, 256, valueName);
+    return deviceIoControl(IOCTL_REG_DELETEVALUE, &input, sizeof(input), nullptr, 0);
+}
+
+bool KernelDriver::regSetValue(const QString& uiPath, const QString& valueName,
+                               quint32 type, const QByteArray& data)
+{
+    ArkRegSetValueInput input;
+    memset(&input, 0, sizeof(input));
+    copyWStrToBuffer(input.keyPath, 384, uiPath);
+    copyWStrToBuffer(input.valueName, 256, valueName);
+    input.type = type;
+
+    QByteArray d = data;
+    if (d.size() > (int)sizeof(input.data)) d.resize(sizeof(input.data));
+    input.dataLength = (quint32)d.size();
+    if (!d.isEmpty()) {
+        memcpy(input.data, d.constData(), d.size());
+    }
+    return deviceIoControl(IOCTL_REG_SETVALUE, &input, sizeof(input), nullptr, 0);
+}
+
+bool KernelDriver::regRenameKey(const QString& uiPath, const QString& newName)
+{
+    ArkRegRenameKeyInput input;
+    memset(&input, 0, sizeof(input));
+    copyWStrToBuffer(input.keyPath, 384, uiPath);
+    copyWStrToBuffer(input.newName, 256, newName);
+    return deviceIoControl(IOCTL_REG_RENAMEKEY, &input, sizeof(input), nullptr, 0);
+}
+
+bool KernelDriver::regRenameValue(const QString& uiPath, const QString& oldName,
+                                  const QString& newName)
+{
+    ArkRegRenameValueInput input;
+    memset(&input, 0, sizeof(input));
+    copyWStrToBuffer(input.keyPath, 384, uiPath);
+    copyWStrToBuffer(input.oldName, 256, oldName);
+    copyWStrToBuffer(input.newName, 256, newName);
+    return deviceIoControl(IOCTL_REG_RENAMEVALUE, &input, sizeof(input), nullptr, 0);
+}
+
+// ===== ARK: 进程扩展 =====
+
+bool KernelDriver::enumProcessHandles(quint32 pid, quint32 startIndex, ArkHandleArray& out)
+{
+    QByteArray buf(sizeof(ArkHandleArray), Qt::Uninitialized);
+    ArkHandleEnumInput input;
+    input.pid = pid;
+    input.startIndex = startIndex;
+    memcpy(buf.data(), &input, sizeof(input));
+    if (!deviceIoControl(IOCTL_ENUMPROCESSHANDLES, buf.data(), sizeof(input),
+                         buf.data(), sizeof(ArkHandleArray))) {
+        return false;
+    }
+    memcpy(&out, buf.constData(), sizeof(ArkHandleArray));
+    return true;
+}
+
+bool KernelDriver::closeProcessHandle(quint32 pid, quint64 handle)
+{
+    ArkCloseHandleInput input;
+    input.pid = pid;
+    input.pad = 0;
+    input.handle = handle;
+    return deviceIoControl(IOCTL_CLOSEHANDLE, &input, sizeof(input), nullptr, 0);
+}
+
+bool KernelDriver::arkReadProcessMemory(quint32 pid, quint64 address, quint32 size, QByteArray& outData)
+{
+    if (size == 0 || size > 0x10000) {
+        outData.clear();
+        return false;
+    }
+    ArkRwMemoryInput input;
+    input.pid = pid;
+    input.pad = 0;
+    input.address = address;
+    input.size = size;
+    input.pad2 = 0;
+
+    QByteArray buf(qMax<quint32>(sizeof(ArkRwMemoryInput), size), Qt::Uninitialized);
+    memcpy(buf.data(), &input, sizeof(input));
+    DWORD br = 0;
+    if (!deviceIoControl(IOCTL_ARK_READMEMORY, buf.data(), sizeof(ArkRwMemoryInput),
+                         buf.data(), size, &br)) {
+        outData.clear();
+        return false;
+    }
+    if (br > size) br = size;
+    outData = QByteArray(buf.constData(), (int)br);
+    return true;
+}
+
+bool KernelDriver::arkWriteProcessMemory(quint32 pid, quint64 address, const QByteArray& data)
+{
+    if (data.isEmpty() || (quint32)data.size() > 0x10000) return false;
+
+    QByteArray buf(sizeof(ArkRwMemoryInput) + data.size(), Qt::Uninitialized);
+    ArkRwMemoryInput input;
+    input.pid = pid;
+    input.pad = 0;
+    input.address = address;
+    input.size = (quint32)data.size();
+    input.pad2 = 0;
+    memcpy(buf.data(), &input, sizeof(input));
+    memcpy(buf.data() + sizeof(input), data.constData(), data.size());
+    return deviceIoControl(IOCTL_ARK_WRITEMEMORY, buf.data(), (DWORD)buf.size(), nullptr, 0);
+}
+
+bool KernelDriver::arkQueryVirtualMemory(quint32 pid, quint64 address, ArkVmInfo& out)
+{
+    ArkQueryVmInput input;
+    input.pid = pid;
+    input.pad = 0;
+    input.address = address;
+    return deviceIoControl(IOCTL_ARK_QUERYVM, &input, sizeof(input), &out, sizeof(out));
+}
+
+bool KernelDriver::arkGetPriority(quint32 pid, ArkPriorityInfo& out)
+{
+    ArkPidInput input;
+    input.pid = pid;
+    input.pad = 0;
+    return deviceIoControl(IOCTL_ARK_GETPRIORITY, &input, sizeof(input), &out, sizeof(out));
+}
+
+bool KernelDriver::arkSetPriority(quint32 pid, quint32 priorityClass)
+{
+    ArkSetPriorityInput input;
+    input.pid = pid;
+    input.pad = 0;
+    input.priorityClass = priorityClass;
+    return deviceIoControl(IOCTL_ARK_SETPRIORITY, &input, sizeof(input), nullptr, 0);
+}
+
+bool KernelDriver::arkGetAffinity(quint32 pid, ArkAffinityInfo& out)
+{
+    ArkPidInput input;
+    input.pid = pid;
+    input.pad = 0;
+    return deviceIoControl(IOCTL_ARK_GETAFFINITY, &input, sizeof(input), &out, sizeof(out));
+}
+
+bool KernelDriver::arkSetAffinity(quint32 pid, quint64 affinity)
+{
+    ArkSetAffinityInput input;
+    input.pid = pid;
+    input.pad = 0;
+    input.affinity = affinity;
+    return deviceIoControl(IOCTL_ARK_SETAFFINITY, &input, sizeof(input), nullptr, 0);
+}
+
+bool KernelDriver::arkGetTokenPrivileges(quint32 pid, ArkPrivilegeArray& out)
+{
+    ArkPidInput input;
+    input.pid = pid;
+    input.pad = 0;
+    return deviceIoControl(IOCTL_ARK_GETPRIVILEGES, &input, sizeof(input), &out, sizeof(out));
+}
+
+bool KernelDriver::arkSetTokenPrivilege(quint32 pid, quint64 luid, quint32 enable)
+{
+    ArkSetPrivInput input;
+    input.pid = pid;
+    input.pad = 0;
+    input.luid = luid;
+    input.enable = enable;
+    input.pad2 = 0;
+    return deviceIoControl(IOCTL_ARK_SETPRIVILEGE, &input, sizeof(input), nullptr, 0);
+}
+
+bool KernelDriver::arkGetTokenInfo(quint32 pid, ArkTokenInfo& out)
+{
+    ArkPidInput input;
+    input.pid = pid;
+    input.pad = 0;
+    return deviceIoControl(IOCTL_ARK_GETTOKENINFO, &input, sizeof(input), &out, sizeof(out));
+}
+
+// ===== ARK: 文件占用扫描 =====
+
+bool KernelDriver::scanFileOccupy(const QString& ntPath, ArkOccupyArray& out)
+{
+    // 输入: WCHAR 路径（如 \??\C:\x.txt 或 \Device\HarddiskVolume4\x.txt）
+    // 输出: ARK_OCCUPY_ARRAY（共用缓冲）
+    std::wstring ws = ntPath.toStdWString();
+    if (ws.size() > 1000) ws.resize(1000);
+    QByteArray buf(sizeof(ArkOccupyArray), Qt::Uninitialized);
+    memcpy(buf.data(), ws.c_str(), (ws.size() + 1) * sizeof(wchar_t));
+    if (!deviceIoControl(IOCTL_SCANFILEOCCUPY, buf.data(),
+                         (DWORD)((ws.size() + 1) * sizeof(wchar_t)),
+                         buf.data(), sizeof(ArkOccupyArray))) {
+        return false;
+    }
+    memcpy(&out, buf.constData(), sizeof(ArkOccupyArray));
+    return true;
+}
+
+// ===== ARK: 内核视图 =====
+
+bool KernelDriver::arkEnumDriverObjects(ArkDriverObjArray& out)
+{
+    return deviceIoControl(IOCTL_ARK_ENUMDRIVEROBJS, nullptr, 0, &out, sizeof(out));
+}
+
+bool KernelDriver::arkGetDriverDetail(quint64 driverObject, ArkDriverDetail& out)
+{
+    return deviceIoControl(IOCTL_ARK_GETDRIVERDETAIL, &driverObject, sizeof(driverObject),
+                           &out, sizeof(out));
+}
+
+bool KernelDriver::arkEnumKernelModules(ArkModuleArray& out)
+{
+    return deviceIoControl(IOCTL_ARK_ENUMMODULES, nullptr, 0, &out, sizeof(out));
+}
+
+bool KernelDriver::arkEnumDeviceObjects(ArkDeviceArray& out)
+{
+    return deviceIoControl(IOCTL_ARK_ENUMDEVICES, nullptr, 0, &out, sizeof(out));
+}
+
+bool KernelDriver::arkGetDeviceDetail(quint64 deviceObject, ArkDeviceDetail& out)
+{
+    return deviceIoControl(IOCTL_ARK_GETDEVICEDETAIL, &deviceObject, sizeof(deviceObject),
+                           &out, sizeof(out));
+}
+
+bool KernelDriver::arkQuerySSDT(ArkSsdtInfo& out)
+{
+    return deviceIoControl(IOCTL_ARK_QUERYSSDT, nullptr, 0, &out, sizeof(out));
+}
+
+bool KernelDriver::arkQueryIDT(ArkIdtInfo& out)
+{
+    return deviceIoControl(IOCTL_ARK_QUERYIDT, nullptr, 0, &out, sizeof(out));
+}
+
+bool KernelDriver::arkEnumObjectTypes(ArkObjTypeArray& out)
+{
+    return deviceIoControl(IOCTL_ARK_ENUMOBJTYPES, nullptr, 0, &out, sizeof(out));
 }

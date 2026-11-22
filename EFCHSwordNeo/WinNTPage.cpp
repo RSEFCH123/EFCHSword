@@ -1,4 +1,4 @@
-#include "WinNTPage.h"
+﻿#include "WinNTPage.h"
 #include "AppContext.h"
 #include "PCInfoDialog.h"
 

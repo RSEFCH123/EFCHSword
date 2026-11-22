@@ -1,4 +1,4 @@
-#include "FilePropertiesDialog.h"
+﻿#include "FilePropertiesDialog.h"
 #include "AppContext.h"
 
 #include <QLabel>

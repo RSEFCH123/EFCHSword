@@ -117,7 +117,14 @@
     <QtMoc Include="DiskHexDialog.h" />
     <QtMoc Include="DeleteDirProgressDialog.h" />
     <QtMoc Include="SystemThreadPage.h" />
+    <QtMoc Include="ProcessBehaviorPage.h" />
+    <QtMoc Include="EtwMonitorPage.h" />
+    <QtMoc Include="HypervisorPage.h" />
+    <QtMoc Include="ExtrasDialogs.h" />
+    <QtMoc Include="KernelPage.h" />
+    <QtMoc Include="NetMonitorPage.h" />
     <ClInclude Include="KernelDriver.h" />
+    <ClInclude Include="NetTable.h" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="MainWindow.cpp" />
     <ClCompile Include="WelcomePage.cpp" />
@@ -139,6 +146,12 @@
     <ClCompile Include="DiskHexDialog.cpp" />
     <ClCompile Include="DeleteDirProgressDialog.cpp" />
     <ClCompile Include="SystemThreadPage.cpp" />
+    <ClCompile Include="ProcessBehaviorPage.cpp" />
+    <ClCompile Include="EtwMonitorPage.cpp" />
+    <ClCompile Include="HypervisorPage.cpp" />
+    <ClCompile Include="ExtrasDialogs.cpp" />
+    <ClCompile Include="KernelPage.cpp" />
+    <ClCompile Include="NetMonitorPage.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="drivers\EFCHKernelDriver.sys" />

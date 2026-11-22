@@ -1,6 +1,7 @@
-#include "ToolsPage.h"
+﻿#include "ToolsPage.h"
 #include "AppContext.h"
 #include "DiskHexDialog.h"
+#include "ExtrasDialogs.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -107,6 +108,25 @@ void ToolsPage::setupUi()
     diskHexLayout->addWidget(diskHexBtn);
     connect(diskHexBtn, &QPushButton::clicked, this, &ToolsPage::onDiskHex);
     mainLayout->addWidget(diskHexGroup);
+
+    // ===== 实用/趣味工具 =====
+    auto* extraGroup = new QGroupBox(QStringLiteral("实用 / 趣味工具"), contentWidget);
+    auto* extraLayout = new QHBoxLayout(extraGroup);
+    auto* shredderBtn = new QPushButton(QStringLiteral("文件粉碎器..."), extraGroup);
+    shredderBtn->setMinimumHeight(40);
+    auto* fireworksBtn = new QPushButton(QStringLiteral("烟花彩蛋 🎆"), extraGroup);
+    fireworksBtn->setMinimumHeight(40);
+    extraLayout->addWidget(shredderBtn);
+    extraLayout->addWidget(fireworksBtn);
+    connect(shredderBtn, &QPushButton::clicked, this, [this] {
+        FileShredderDialog dlg(this);
+        dlg.exec();
+    });
+    connect(fireworksBtn, &QPushButton::clicked, this, [this] {
+        auto* fw = new FireworksDialog(this);
+        fw->show();
+    });
+    mainLayout->addWidget(extraGroup);
 
     // ===== 驱动/设备枚举 (右键支持强制卸载驱动和设置) =====
     auto* enumGroup = new QGroupBox(QStringLiteral("驱动/设备枚举 (右键: 强制卸载/设置)"), contentWidget);

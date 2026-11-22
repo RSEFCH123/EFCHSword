@@ -1,6 +1,8 @@
-#pragma once
+﻿#pragma once
 
 #include <QWidget>
+#include <QVector>
+#include "KernelDriver.h"
 
 class QTreeWidget;
 class QTableWidget;
@@ -8,7 +10,8 @@ class QLineEdit;
 class QTreeWidgetItem;
 
 // 注册表标签页
-// 对应易语言: 组合框_注册表 + 树形框注册表 + 注册表操作
+// 驱动可用时全部操作走内核 IOCTL（System 令牌上下文，可越过 HKLM 等
+// 键的普通 ACL 限制）；无驱动时回退 QSettings 用户层实现。
 class RegeditPage : public QWidget
 {
     Q_OBJECT
@@ -36,6 +39,7 @@ private:
     void setupTreeContextMenu();
     void setupTableContextMenu();
     void loadSubKeys(QTreeWidgetItem* parent, const QString& fullPath);
+    QStringList childGroupsSafe(const QString& fullPath);
     void loadValues(const QString& fullPath);
     QString currentPath() const;
 
@@ -43,4 +47,7 @@ private:
     QTableWidget* m_valueTable = nullptr;
     class QMenu* m_treeMenu = nullptr;
     class QMenu* m_tableMenu = nullptr;
+
+    // 内核枚举的当前键值原始数据（供修改时取类型/初值），行号即下标
+    QVector<ArkRegValue> m_currentValues;
 };

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QWidget>
 #include <QHash>
@@ -35,6 +35,9 @@ private slots:
     // 进程操作
     void onKillProcess();              // 驱动结束进程（直接 zwKill/psp/apc）
     void onForceKillProcess();         // 强制结束进程（Ctrl信号→窗口消息→驱动结束）
+    void onHvmKillProcess();           // HVM 强杀：R-1 拒绝执行关键页，命中注入 #UD
+    void onHvmFreezeProcess();         // HVM 冻结：命中注入 #PF，原地自旋，可撤销
+    void onHvmResumeProcess();         // HVM 恢复：撤销冻结/强杀处置
     void onSuspendProcess();
     void onResumeProcess();
     void onHideProcess();

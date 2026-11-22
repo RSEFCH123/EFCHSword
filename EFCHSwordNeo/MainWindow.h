@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QMainWindow>
 #include <QStackedWidget>
@@ -16,6 +16,11 @@ class RegeditPage;
 class WinNTPage;
 class AboutPage;
 class SystemThreadPage;
+class KernelPage;
+class NetMonitorPage;
+class ProcessBehaviorPage;
+class EtwMonitorPage;
+class HypervisorPage;
 
 // 主窗口
 // 对应易语言: _启动窗口 (高级选择夹1 + 标签页)
@@ -54,10 +59,16 @@ private:
     WinNTPage* m_winntPage = nullptr;
     AboutPage* m_aboutPage = nullptr;
     SystemThreadPage* m_systemThreadPage = nullptr;
+    KernelPage* m_kernelPage = nullptr;
+    NetMonitorPage* m_netMonitorPage = nullptr;
+    ProcessBehaviorPage* m_behaviorPage = nullptr;
+    EtwMonitorPage* m_etwPage = nullptr;
+    HypervisorPage* m_hypervisorPage = nullptr;
 
     // 状态栏
     QLabel* m_statusVersion = nullptr;
     QLabel* m_statusProcessCount = nullptr;
     QLabel* m_statusCpu = nullptr;
     QLabel* m_statusMemory = nullptr;
+    QLabel* m_statusDriverVer = nullptr;
 };

@@ -1,4 +1,4 @@
-// 必须在 windows.h 之前定义，防止 windows.h 包含 winsock.h 与 winsock2.h 冲突
+﻿// 必须在 windows.h 之前定义，防止 windows.h 包含 winsock.h 与 winsock2.h 冲突
 #define _WINSOCKAPI_
 #include "PCInfoDialog.h"
 #include "AppContext.h"

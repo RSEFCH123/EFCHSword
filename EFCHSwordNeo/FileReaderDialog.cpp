@@ -1,4 +1,4 @@
-#include "FileReaderDialog.h"
+﻿#include "FileReaderDialog.h"
 #include "AppContext.h"
 
 #include <QPlainTextEdit>
